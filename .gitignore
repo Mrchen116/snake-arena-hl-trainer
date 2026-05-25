@@ -1,0 +1,17 @@
+.DS_Store
+.env
+.venv/
+__pycache__/
+.pytest_cache/
+*.pyc
+*.egg-info/
+
+# Data slots — populated by train.py copy_in from ~/Repos/snake-data/<exp>/,
+# persisted back via copy_out. Never tracked in the trainer repo.
+snake_hl/policy.py
+experiments/
+
+# Editor / IDE state
+.claude/
+.idea/
+.vscode/

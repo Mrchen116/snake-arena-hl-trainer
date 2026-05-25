@@ -1,0 +1,1 @@
+"""Snake Arena HL package."""
