@@ -85,12 +85,6 @@ VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 # 旧 monolithic 仓的归档目录。出现时连同兄弟实验一起 deny。
 ARCHIVE_DIR = Path.home() / "Repos" / "snake-arena-hl-archive"
 
-# Claude CLI 启动时注入的额外环境变量
-CLAUDE_ENV_DEFAULTS = {
-    "ENABLE_TOOL_SEARCH": "false",
-    "ANTHROPIC_BASE_URL": "https://api.kimi.com/coding/",
-}
-
 # 单文件 cp：optimizer 编辑 snake_hl/policy.py 这个运行槽，每轮结束 copy_out 回 exp。
 # 其他 data 文件（heuristic_notes、runs、replays、reports 等）都直接在
 # experiments/<exp>/ 下读写，不再有 trainer-side 运行槽。
@@ -190,10 +184,14 @@ def load_dotenv(path: Path = ROOT / ".env") -> dict[str, str]:
 
 
 def claude_env() -> dict[str, str]:
-    """构造 Claude CLI 子进程的环境变量。"""
-    env = {**load_dotenv(), **os.environ}
-    env.update(CLAUDE_ENV_DEFAULTS)
-    return env
+    """构造 Claude CLI 子进程的环境变量。
+
+    .env 提供默认值，shell 当前 environment 覆盖。
+    不在 trainer 源码里硬编码任何 provider/base-URL/model—— 这些都从 .env 读。
+    支持的 vars 见 .env.example（ANTHROPIC_API_KEY 必填，BASE_URL / model overrides 等
+    取决于使用 Kimi / Mimo / 官方 API 哪一家）。
+    """
+    return {**load_dotenv(), **os.environ}
 
 
 MIN_IMPROVEMENT = 2.0
