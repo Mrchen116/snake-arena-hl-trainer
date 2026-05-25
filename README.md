@@ -107,14 +107,19 @@ source .venv/bin/activate
 pip install -e ".[dev]"
 pytest
 
-# Set up an experiment data directory (only needed once per experiment)
-mkdir -p ~/Repos/snake-data
-cp -r ~/Repos/snake-data/r14-baseline ~/Repos/snake-data/<new-exp-name>
+# Tell train.py where your experiments live. Put this in ~/.zshrc or ~/.bashrc.
+# train.py refuses to start without it (and deliberately doesn't hardcode a
+# default — that would leak the path to the optimizer subprocess).
+export SNAKE_DATA_HOME=/path/to/snake-data
 
-# Run training rounds
-python3 train.py --exp <new-exp-name> --rounds 1 --optimizer claude
+# Fork + run in one command (creates <new-exp-name> from r14-baseline,
+# then trains 5 rounds).
+python3 train.py --exp <new-exp-name> --new-from r14-baseline --rounds 5 --optimizer claude
 
-# Inspect the loaded experiment's data directly
+# Subsequent runs against the same experiment
+python3 train.py --exp <new-exp-name> --rounds 5 --optimizer claude
+
+# Inspect the loaded experiment's working slots directly
 python3 -m snake_hl.eval --policy current --split train
 python3 -m snake_hl.failure_report --policy current --split train --limit 5
 ```

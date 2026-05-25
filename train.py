@@ -59,7 +59,24 @@ def _load_snake_hl_modules() -> None:
 
 
 ROOT = Path(__file__).resolve().parent
-DATA_HOME_BASE = Path.home() / "Repos" / "snake-data"
+
+# 数据仓库根目录。从环境变量 SNAKE_DATA_HOME 读取，无默认值——
+# 不把路径硬编码在源码里，避免 optimizer 通过 cat train.py 推断出兄弟实验的位置。
+# 调用者必须先 export SNAKE_DATA_HOME=/path/to/snake-data 才能运行 train.py。
+# claude_env() 在启动 optimizer 子进程前会把这个变量从环境里删掉，避免泄漏。
+def _resolve_data_home_base() -> Path:
+    raw = os.environ.get("SNAKE_DATA_HOME")
+    if not raw:
+        raise RuntimeError(
+            "SNAKE_DATA_HOME environment variable is required.\n"
+            "Set it to the directory containing your experiment subdirectories, e.g.:\n"
+            "  export SNAKE_DATA_HOME=/path/to/snake-data\n"
+            "(Hardcoding this default in train.py would leak the location to the optimizer.)"
+        )
+    return Path(raw).expanduser()
+
+
+DATA_HOME_BASE = _resolve_data_home_base()
 
 # Claude CLI 启动时注入的额外环境变量
 CLAUDE_ENV_DEFAULTS = {
@@ -192,9 +209,14 @@ def load_dotenv(path: Path = ROOT / ".env") -> dict[str, str]:
 
 
 def claude_env() -> dict[str, str]:
-    """合并 .env、当前环境变量和 CLAUDE_ENV_DEFAULTS，作为 Claude CLI 的运行环境。"""
+    """合并 .env、当前环境变量和 CLAUDE_ENV_DEFAULTS，作为 Claude CLI 的运行环境。
+
+    会从环境里 scrub 掉 SNAKE_DATA_HOME，避免 optimizer 子进程通过 os.environ
+    读到数据仓库的位置，进而 ls 兄弟实验目录、污染实验隔离。
+    """
     env = {**load_dotenv(), **os.environ}
     env.update(CLAUDE_ENV_DEFAULTS)
+    env.pop("SNAKE_DATA_HOME", None)
     return env
 
 
@@ -811,6 +833,16 @@ def main() -> None:
         required=True,
         help=f"Experiment name; data lives at {DATA_HOME_BASE}/<exp>/",
     )
+    parser.add_argument(
+        "--new-from",
+        type=str,
+        metavar="BASE",
+        help=(
+            "Create a fresh experiment by forking from this existing experiment "
+            "(its .git is excluded so the new exp starts without remote/history)."
+            " Fails if --exp already exists."
+        ),
+    )
     parser.add_argument("--rounds", type=int, default=1)
     parser.add_argument("--optimizer", choices=("claude", "none"), default="claude")
     parser.add_argument("--dry-run", action="store_true", help="Prepare prompt without invoking optimizer.")
@@ -819,6 +851,18 @@ def main() -> None:
     args = parser.parse_args()
 
     data_home = data_home_for(args.exp)
+
+    if args.new_from:
+        if data_home.exists():
+            raise RuntimeError(
+                f"--new-from cannot overwrite an existing experiment at {data_home}. "
+                f"Use a fresh --exp name, or remove that directory manually first."
+            )
+        base = data_home_for(args.new_from)
+        validate_data_home(base)
+        shutil.copytree(base, data_home, ignore=shutil.ignore_patterns(".git"))
+        print(f"Forked experiment '{args.exp}' from '{args.new_from}' at {data_home}")
+
     validate_data_home(data_home)
     copy_in(data_home)
     _load_snake_hl_modules()  # snake_hl.policy 现在存在，可以 import 了
