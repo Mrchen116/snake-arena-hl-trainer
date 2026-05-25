@@ -611,6 +611,11 @@ def run_claude_optimizer(prompt: str, output: Path, max_budget_usd: float, cwd: 
     """
     require_claude_env()
     env = claude_env()
+    # --model 传 alias "sonnet"（不是具体 model ID），让 Claude CLI 经由 .env 里的
+    # ANTHROPIC_DEFAULT_SONNET_MODEL 重映射到 provider 实际模型。
+    # 选 sonnet 而不是 opus 的理由：sonnet 是 200K 上下文，opus 是 1M；
+    # Kimi 和 Mimo 等第三方 provider 通常只提供 200K 级模型，传 opus 会被拒。
+    # 硬编码具体 model ID（如 claude-sonnet-4-6）会让某些 provider 返回 400。
     result = subprocess.run(
         [
             "claude",
@@ -618,7 +623,7 @@ def run_claude_optimizer(prompt: str, output: Path, max_budget_usd: float, cwd: 
             "--permission-mode",
             "dontAsk",
             "--model",
-            "claude-sonnet-4-6",
+            "sonnet",
             "--max-budget-usd",
             str(max_budget_usd),
             prompt,
