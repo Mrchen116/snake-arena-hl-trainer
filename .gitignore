@@ -6,8 +6,9 @@ __pycache__/
 *.pyc
 *.egg-info/
 
-# Data slots — populated by train.py copy_in from ~/Repos/snake-data/<exp>/,
-# persisted back via copy_out. Never tracked in the trainer repo.
+# Per-experiment data. train.py copies experiments/<exp>/policy.py into the
+# snake_hl/policy.py slot at start, copies back at end of each round. Both
+# locations are local-only scratch from the trainer's perspective.
 snake_hl/policy.py
 experiments/
 

@@ -75,7 +75,7 @@ def main() -> None:
     parser.add_argument("--policy", choices=sorted(POLICIES), default="current")
     parser.add_argument("--split", choices=("train", "eval"), default="train")
     parser.add_argument("--limit", type=int, default=5)
-    parser.add_argument("--output", type=Path, default=Path("experiments/reports/train-failures.md"))
+    parser.add_argument("--output", type=Path, default=Path("reports/train-failures.md"))
     args = parser.parse_args()
 
     path = write_failure_report(args.policy, args.split, args.limit, args.output)
