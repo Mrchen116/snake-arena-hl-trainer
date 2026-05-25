@@ -657,7 +657,10 @@ def update_training_curve(
     after_train: dict,
     after_eval: dict,
 ) -> None:
-    """追加一轮结果到训练曲线 JSON 并重新生成 HTML。每个实验有自己的曲线。"""
+    """追加一轮结果到训练曲线 JSON 并重新生成 HTML。每个实验有自己的曲线。
+
+    同时刷新 experiments/all-curves.html 跨实验聚合视图。
+    """
     curve_json = data_home / "training_curve.json"
     curve_html = data_home / "training_curve.html"
 
@@ -676,6 +679,7 @@ def update_training_curve(
     })
     curve_json.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
     generate_training_curve_html(records, curve_html, data_home.name)
+    update_aggregate_curve()
 
 
 def generate_training_curve_html(records: list[dict], curve_html: Path, exp_name: str) -> None:
@@ -807,6 +811,168 @@ document.querySelectorAll('td.time').forEach(el => {{
     curve_html.write_text(html, encoding="utf-8")
 
 
+def update_aggregate_curve() -> None:
+    """
+    扫描 experiments/*/training_curve.json，把所有实验的曲线画在一个 HTML 里，
+    便于跨实验对比（类比 wandb 的 project view）。
+
+    输出到 experiments/all-curves.html。每个实验一种颜色，train 实线 + eval 虚线。
+    X 轴是 round 号；不同实验长度不同时，短的会留空白（spanGaps=false）。
+    没有任何实验数据时跳过（不会写空文件）。
+    """
+    if not DATA_HOME_BASE.exists():
+        return
+
+    experiments_data: list[dict] = []
+    for exp_dir in sorted(DATA_HOME_BASE.iterdir()):
+        if not exp_dir.is_dir() or exp_dir.name.startswith("."):
+            continue
+        curve_json = exp_dir / "training_curve.json"
+        if not curve_json.exists():
+            continue
+        try:
+            records = json.loads(curve_json.read_text(encoding="utf-8"))
+        except json.JSONDecodeError:
+            continue
+        if records:
+            experiments_data.append({"name": exp_dir.name, "records": records})
+
+    if not experiments_data:
+        return
+
+    max_round = max(max(r["round"] for r in exp["records"]) for exp in experiments_data)
+    labels = [f"R{i + 1}" for i in range(max_round)]
+
+    # 暗色背景上效果较好的 8 色调色板（与 Tailwind 接近的中等亮度色）
+    palette = [
+        "#4fc3f7", "#a5d6a7", "#ffb74d", "#f06292",
+        "#ba68c8", "#7986cb", "#e57373", "#90a4ae",
+    ]
+
+    datasets: list[dict] = []
+    all_scores: list[float] = []
+    summary_rows: list[str] = []
+    for i, exp in enumerate(experiments_data):
+        color = palette[i % len(palette)]
+        records = exp["records"]
+        train_data: list[float | None] = [None] * max_round
+        eval_data: list[float | None] = [None] * max_round
+        for r in records:
+            idx = r["round"] - 1
+            if 0 <= idx < max_round:
+                train_data[idx] = r.get("train_after")
+                eval_data[idx] = r.get("eval_after")
+                for v in (r.get("train_after"), r.get("eval_after")):
+                    if v is not None:
+                        all_scores.append(v)
+        datasets.append({
+            "label": f"{exp['name']} train",
+            "data": train_data,
+            "borderColor": color,
+            "backgroundColor": "transparent",
+            "pointRadius": 3,
+            "tension": 0.3,
+            "spanGaps": False,
+        })
+        datasets.append({
+            "label": f"{exp['name']} eval",
+            "data": eval_data,
+            "borderColor": color,
+            "backgroundColor": "transparent",
+            "borderDash": [5, 5],
+            "pointRadius": 3,
+            "tension": 0.3,
+            "spanGaps": False,
+        })
+
+        # 汇总表行：最后一轮的状态
+        last = records[-1]
+        summary_rows.append(
+            f'<tr>'
+            f'<td><span class="swatch" style="background:{color}"></span>{exp["name"]}</td>'
+            f'<td>{len(records)}</td>'
+            f'<td>{last.get("train_after", "—")}</td>'
+            f'<td>{last.get("eval_after", "—")}</td>'
+            f'<td class="time" data-ts="{last.get("timestamp", "")}"></td>'
+            f'</tr>'
+        )
+
+    y_min = round(min(all_scores) * 0.97) if all_scores else 0
+    y_max = round(max(all_scores) * 1.02) if all_scores else 800
+
+    labels_js = json.dumps(labels)
+    datasets_js = json.dumps(datasets)
+
+    html = f"""<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Snake HL — All Experiments</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+  body {{ font-family: sans-serif; background: #1a1a2e; color: #eee; padding: 24px; }}
+  h1 {{ font-size: 1.2rem; margin-bottom: 8px; }}
+  .meta {{ font-size: 0.85rem; color: #aaa; margin-bottom: 20px; }}
+  canvas {{ max-width: 1100px; }}
+  table {{ border-collapse: collapse; margin-top: 24px; font-size: 0.85rem; }}
+  th, td {{ border: 1px solid #444; padding: 6px 12px; text-align: right; }}
+  th {{ background: #2a2a4e; }}
+  td:first-child {{ text-align: left; }}
+  tr:hover td {{ background: #2a2a3e; }}
+  td.time {{ color: #aaa; font-size: 0.8rem; }}
+  .swatch {{
+    display: inline-block; width: 10px; height: 10px;
+    margin-right: 6px; border-radius: 2px; vertical-align: middle;
+  }}
+  .legend-note {{ color: #888; font-size: 0.8rem; margin-top: 8px; }}
+</style>
+</head>
+<body>
+<h1>Snake Arena HL — All Experiments</h1>
+<p class="meta">Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} &nbsp;|&nbsp; {len(experiments_data)} experiments</p>
+<canvas id="chart"></canvas>
+<p class="legend-note">实线 = train avg_score，虚线 = eval avg_score。同色 = 同一实验。</p>
+<script>
+const labels = {labels_js};
+const datasets = {datasets_js};
+
+function fmtTime(ts) {{
+  if (!ts) return '';
+  return new Date(ts).toLocaleString('zh-CN', {{
+    month: '2-digit', day: '2-digit',
+    hour: '2-digit', minute: '2-digit', hour12: false
+  }});
+}}
+
+new Chart(document.getElementById('chart'), {{
+  type: 'line',
+  data: {{ labels, datasets }},
+  options: {{
+    scales: {{
+      y: {{ min: {y_min}, max: {y_max}, grid: {{ color: '#333' }}, ticks: {{ color: '#ccc' }} }},
+      x: {{ grid: {{ color: '#333' }}, ticks: {{ color: '#ccc', maxRotation: 0 }} }},
+    }},
+    plugins: {{
+      legend: {{ labels: {{ color: '#eee', boxWidth: 14 }} }},
+      tooltip: {{ mode: 'index', intersect: false }},
+    }},
+  }},
+}});
+
+document.querySelectorAll('td.time').forEach(el => {{
+  el.textContent = fmtTime(el.dataset.ts);
+}});
+</script>
+<table>
+<tr><th>Experiment</th><th>Rounds</th><th>Latest train</th><th>Latest eval</th><th>Last updated</th></tr>
+{"".join(summary_rows)}
+</table>
+</body>
+</html>
+"""
+    (DATA_HOME_BASE / "all-curves.html").write_text(html, encoding="utf-8")
+
+
 # ============================================================
 # 单轮编排
 # ============================================================
@@ -932,8 +1098,12 @@ def main() -> None:
     parser.add_argument(
         "--exp",
         type=str,
-        required=True,
-        help=f"Experiment name; data lives at {DATA_HOME_BASE}/<exp>/",
+        help=f"Experiment name; data lives at {DATA_HOME_BASE}/<exp>/ (required unless --aggregate-only).",
+    )
+    parser.add_argument(
+        "--aggregate-only",
+        action="store_true",
+        help="Regenerate experiments/all-curves.html from existing training_curve.json files and exit.",
     )
     parser.add_argument(
         "--new-from",
@@ -951,6 +1121,15 @@ def main() -> None:
     parser.add_argument("--max-budget-usd", type=float, default=999.0)
     parser.add_argument("--run-dir", type=Path)
     args = parser.parse_args()
+
+    if args.aggregate_only:
+        update_aggregate_curve()
+        target = DATA_HOME_BASE / "all-curves.html"
+        print(f"Aggregate curve regenerated: {target}")
+        return
+
+    if not args.exp:
+        parser.error("--exp is required (unless --aggregate-only)")
 
     data_home = data_home_for(args.exp)
 
