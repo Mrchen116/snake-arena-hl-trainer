@@ -103,6 +103,7 @@ IGNORED_SNAPSHOT_PARTS = {
     ".pytest_cache",
     "__pycache__",
     "snake_arena_hl.egg-info",
+    ".DS_Store",   # macOS Finder 自动生成，不是 optimizer 写的
     "experiments",  # data 目录整个跳过，optimizer 在里面的活动不受 hash 检查
 }
 
@@ -592,52 +593,103 @@ def require_claude_env() -> None:
         )
 
 
-def run_claude_optimizer(prompt: str, output: Path, max_budget_usd: float, cwd: Path) -> None:
+def _run_claude(
+    args: list[str],
+    output: Path,
+    cwd: Path,
+) -> tuple[str, str | None]:
     """
-    cwd 指向 experiments/<exp>/。这样 optimizer 启动时会读到该目录下的
-    .claude/settings.local.json，被 deny 访问兄弟实验和归档。
-
-    --permission-mode dontAsk：白名单自动批准，未在 allow 列表里的工具自动拒绝
-                               （不弹窗等用户确认）。比 --dangerously-skip-permissions
-                               安全得多——后者直接关掉权限层。
+    底层：执行 claude 子进程，--output-format json，返回 (text_result, session_id)。
+    args 是 claude 命令行参数（不含 "claude" 本身）。
     """
     require_claude_env()
     env = claude_env()
-    # --model 传 alias "sonnet"（不是具体 model ID），让 Claude CLI 经由 .env 里的
-    # ANTHROPIC_DEFAULT_SONNET_MODEL 重映射到 provider 实际模型。
-    # 选 sonnet 而不是 opus 的理由：sonnet 是 200K 上下文，opus 是 1M；
-    # Kimi 和 Mimo 等第三方 provider 通常只提供 200K 级模型，传 opus 会被拒。
-    # 硬编码具体 model ID（如 claude-sonnet-4-6）会让某些 provider 返回 400。
     result = subprocess.run(
-        [
-            "claude",
-            "--print",
-            "--permission-mode",
-            "dontAsk",
-            "--model",
-            "sonnet",
-            "--max-budget-usd",
-            str(max_budget_usd),
-            prompt,
-        ],
+        ["claude", *args, "--output-format", "json"],
         cwd=cwd,
         env=env,
         text=True,
         capture_output=True,
     )
+    # 尝试解析 JSON，提取 result + session_id
+    text = result.stdout
+    session_id: str | None = None
+    try:
+        data = json.loads(result.stdout)
+        text = data.get("result", result.stdout)
+        session_id = data.get("session_id")
+    except (json.JSONDecodeError, AttributeError):
+        pass
     output.write_text(
         "STDOUT:\n" + result.stdout + "\nSTDERR:\n" + result.stderr,
         encoding="utf-8",
     )
     if result.returncode != 0:
-        raise RuntimeError(f"Claude optimizer failed ({result.returncode}). See {output}")
+        raise RuntimeError(f"Claude subprocess failed ({result.returncode}). See {output}")
+    return text, session_id
 
 
-def assert_optimizer_boundary(changes: Iterable[str]) -> None:
-    illegal = sorted(path for path in changes if path not in ALLOWED_OPTIMIZER_EDITS)
-    if illegal:
-        formatted = "\n".join(f"- {path}" for path in illegal)
-        raise RuntimeError(f"Optimizer changed files outside the allowed boundary:\n{formatted}")
+def run_claude_optimizer(
+    prompt: str, output: Path, max_budget_usd: float, cwd: Path
+) -> tuple[str, str | None]:
+    """
+    首次启动优化器。cwd 指向 experiments/<exp>/，optimizer 读到该目录下的
+    .claude/settings.local.json，Edit/Write 被限制在 policy slot + exp dir。
+
+    --permission-mode dontAsk：allow 列表内自动批准，不在列表里的自动拒绝。
+    --model sonnet：alias 经由 ANTHROPIC_DEFAULT_SONNET_MODEL 重映射到 provider 模型。
+    """
+    return _run_claude(
+        [
+            "--print",
+            "--permission-mode", "dontAsk",
+            "--model", "sonnet",
+            "--max-budget-usd", str(max_budget_usd),
+            prompt,
+        ],
+        output=output,
+        cwd=cwd,
+    )
+
+
+def send_optimizer_feedback(
+    session_id: str,
+    feedback: str,
+    output: Path,
+    cwd: Path,
+) -> tuple[str, str | None]:
+    """
+    用 --resume 把反馈发回给已有 session，让 optimizer 在完整上下文里继续改。
+    用于：边界违规（改了 trainer 代码）或分数不够时的迭代反馈。
+    """
+    return _run_claude(
+        [
+            "--print",
+            "--resume", session_id,
+            "--permission-mode", "dontAsk",
+            "--model", "sonnet",
+            feedback,
+        ],
+        output=output,
+        cwd=cwd,
+    )
+
+
+def find_boundary_violations(changes: Iterable[str]) -> list[str]:
+    """返回超出允许范围的变更文件列表（空列表 = 合规）。"""
+    return sorted(path for path in changes if path not in ALLOWED_OPTIMIZER_EDITS)
+
+
+def revert_boundary_violations(violations: list[str]) -> None:
+    """用 git checkout HEAD 把越界文件还原，让后续 eval 基于合法状态。"""
+    for path in violations:
+        subprocess.run(
+            ["git", "checkout", "HEAD", "--", path],
+            cwd=ROOT,
+            check=True,
+            capture_output=True,
+        )
+    print(f"  ↩ Reverted {len(violations)} boundary violation(s): {', '.join(violations)}")
 
 
 # ============================================================
@@ -791,32 +843,92 @@ def run_round(
             "before_train": before_train,
         }
 
-    # ── ④ 参数更新（cwd=data_home，optimizer 读 exp dir 的 settings 被 deny）──
+    # ── ④⑤⑥⑦⑧ 优化 + 边界检查 + 评分（最多 MAX_FEEDBACK 次反馈循环）──────────
+    MAX_FEEDBACK = 3
     before_hashes = snapshot_repo()
-    if optimizer == "claude":
-        run_claude_optimizer(prompt, round_dir / "claude-output.txt", max_budget_usd, cwd=data_home)
-    else:
-        raise ValueError(f"Unknown optimizer: {optimizer}")
+    session_id: str | None = None
+    after_train: dict = {}
+    after_eval: dict = {}
+    optimizer_changes: list[str] = []
 
-    # ── ⑤ 参数约束 ────────────────────────────
-    after_hashes = snapshot_repo()
-    optimizer_changes = changed_files(before_hashes, after_hashes)
-    assert_optimizer_boundary(optimizer_changes)
+    for attempt in range(MAX_FEEDBACK + 1):
+        output_file = round_dir / (
+            "claude-output.txt" if attempt == 0 else f"claude-output-fb{attempt}.txt"
+        )
 
-    # ── ⑥ 加载新参数 ──────────────────────────
-    reload_policy_modules()
+        if attempt == 0:
+            if optimizer == "claude":
+                _, session_id = run_claude_optimizer(
+                    prompt, output_file, max_budget_usd, cwd=data_home
+                )
+            else:
+                raise ValueError(f"Unknown optimizer: {optimizer}")
+        else:
+            if session_id is None:
+                print("  ✗ No session_id to resume (provider may not support --resume).")
+                break
+            print(f"  → Feedback attempt {attempt}/{MAX_FEEDBACK} (session {session_id[:8]}…)")
+            _, session_id = send_optimizer_feedback(
+                session_id, feedback_msg, output_file, cwd=data_home
+            )
 
-    # ── ⑦ 回归测试 ────────────────────────────
-    run_command([sys.executable, "-m", "pytest"], output=round_dir / "pytest.txt")
+        # ── ⑤ 边界检查 ─────────────────────────
+        after_hashes = snapshot_repo()
+        optimizer_changes = changed_files(before_hashes, after_hashes)
+        violations = find_boundary_violations(optimizer_changes)
+        feedback_parts: list[str] = []
 
-    # ── ⑧ 训练集评分 ──────────────────────────
-    after_train, _ = eval_module.evaluate("current", "train")
-    after_train["run_type"] = "train_after_optimizer"
-    after_train["round"] = round_index
-    eval_module.append_trial(after_train, data_home / "trials.jsonl")
-    write_json(round_dir / "train-after.json", after_train)
+        if violations:
+            revert_boundary_violations(violations)
+            # 还原后重新计算 changes（violations 已被 revert）
+            after_hashes = snapshot_repo()
+            optimizer_changes = changed_files(before_hashes, after_hashes)
+            feedback_parts.append(
+                f"你刚才修改了以下不允许修改的文件，改动已被自动还原：\n"
+                + "\n".join(f"  - {v}" for v in violations)
+                + f"\n\n允许修改的文件只有：\n"
+                f"  - {POLICY_SLOT}（policy 运行槽）\n"
+                f"  - 你的实验目录下的文件（heuristic_notes.md, journal.md, scripts/ 等）\n"
+                f"\n请不要修改 trainer 代码（env.py、eval.py、baselines.py 等），"
+                f"只改 {POLICY_SLOT}，然后重新运行 eval 验证分数。"
+            )
 
-    # ── ⑨ 验证集评分 ──────────────────────────
+        # ── ⑥ 加载新参数 ────────────────────────
+        reload_policy_modules()
+
+        # ── ⑦ 回归测试 ──────────────────────────
+        run_command([sys.executable, "-m", "pytest"], output=round_dir / "pytest.txt")
+
+        # ── ⑧ 训练集评分 ────────────────────────
+        after_train, _ = eval_module.evaluate("current", "train")
+        after_train["run_type"] = "train_after_optimizer"
+        after_train["round"] = round_index
+        eval_module.append_trial(after_train, data_home / "trials.jsonl")
+        write_json(round_dir / "train-after.json", after_train)
+
+        improvement = after_train["avg_score"] - before_train["avg_score"]
+        target_score = round(before_train["avg_score"] + MIN_IMPROVEMENT, 3)
+
+        if improvement < MIN_IMPROVEMENT:
+            feedback_parts.append(
+                f"当前 train avg_score = {after_train['avg_score']:.3f}，"
+                f"比本轮开始前提升了 {improvement:+.3f} 分，"
+                f"但目标是至少 +{MIN_IMPROVEMENT} 分（达到 {target_score}）。\n\n"
+                f"请继续分析 failure report，尝试不同方向。"
+                f"若参数微调已到瓶颈，考虑结构性或算法性改动。"
+                f"先读 journal.md，不要重试已失败的方向。"
+            )
+
+        if not feedback_parts:
+            break  # 边界合规 + 分数够 → 成功
+
+        if attempt >= MAX_FEEDBACK:
+            print(f"  ✗ 反馈循环耗尽（{MAX_FEEDBACK} 次），接受当前结果。")
+            break
+
+        feedback_msg = "\n\n---\n\n".join(feedback_parts)
+
+    # ── ⑨ 验证集评分 ──────────────────────────────────────────────────────────
     after_eval, _ = eval_module.evaluate("current", "eval")
     after_eval["run_type"] = "eval_after_optimizer"
     after_eval["round"] = round_index
