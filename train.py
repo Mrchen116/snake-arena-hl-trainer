@@ -310,8 +310,9 @@ def write_optimizer_permissions(data_home: Path) -> None:
         "Bash(cd *)",
         "Bash(echo *)",
         # Edit/Write：精确路径，不用裸 "Edit"（裸 allow 会覆盖所有 deny）
-        f"Edit({POLICY_SLOT})",
-        f"Write({POLICY_SLOT})",
+        # // 开头 = 绝对路径（文档规定：/path 是相对项目根，//path 才是绝对路径）
+        f"Edit(/{POLICY_SLOT})",
+        f"Write(/{POLICY_SLOT})",
         f"Edit(/{data_home}/**)",
         f"Write(/{data_home}/**)",
         # Read：保持宽松（读不如写危险；dontAsk 下 sibling deny best-effort）
