@@ -45,6 +45,7 @@ import os
 import shutil
 import subprocess
 import sys
+import time
 from datetime import datetime, timezone
 from pathlib import Path
 
@@ -469,6 +470,56 @@ def snapshot_round_artifacts(round_dir: Path, data_home: Path) -> None:
 # ============================================================
 
 
+# 触发 _run_claude 自动重试的瞬时错误特征。
+# 仅匹配明确属于"网络/服务侧抖动、与本地代码无关"的 token。
+_TRANSIENT_CLAUDE_ERROR_TOKENS = (
+    "ECONNRESET",
+    "ETIMEDOUT",
+    "ENETUNREACH",
+    "ENOTFOUND",
+    "EAI_AGAIN",
+    "socket hang up",
+    "Unable to connect to API",
+    "Connection error",
+    "fetch failed",
+    "Overloaded",
+    "rate_limit_error",
+    "503 Service Unavailable",
+    "502 Bad Gateway",
+    "504 Gateway Timeout",
+)
+
+_MAX_NETWORK_RETRIES = 3
+_NETWORK_BACKOFF_SECONDS = (15, 45, 120)
+
+
+def _is_transient_claude_error(combined_output: str) -> bool:
+    if not combined_output:
+        return False
+    return any(tok in combined_output for tok in _TRANSIENT_CLAUDE_ERROR_TOKENS)
+
+
+def _build_resume_retry_args(original_args: list[str], session_id: str) -> list[str]:
+    """从原始 args 派生出"续 session"的重试 args。
+
+    - 删掉旧的 `--resume <id>`（如果有）
+    - 把末尾的位置参数（prompt）替换成"继续"提示
+    - 在 `--print` 之后插入 `--resume <session_id>`
+    """
+    args = list(original_args)
+    i = 0
+    while i < len(args):
+        if args[i] == "--resume" and i + 1 < len(args):
+            del args[i:i + 2]
+            continue
+        i += 1
+    if args and not args[-1].startswith("--"):
+        args[-1] = "之前网络中断了，现在继续完成。"
+    insert_at = 1 if args and args[0] == "--print" else 0
+    args[insert_at:insert_at] = ["--resume", session_id]
+    return args
+
+
 def _run_claude(
     args: list[str],
     output: Path,
@@ -477,30 +528,72 @@ def _run_claude(
     """
     底层：执行 claude 子进程，--output-format json，返回 (text_result, session_id)。
     args 是 claude 命令行参数（不含 "claude" 本身）。
+
+    瞬时网络/服务端错误（ECONNRESET / Overloaded / 5xx 等）自动重试：
+    若上次拿到了 session_id，就改用 `--resume` 形态续上，避免重头再来。
     """
     env = claude_env()
-    result = subprocess.run(
-        ["claude", *args, "--output-format", "json"],
-        cwd=cwd,
-        env=env,
-        text=True,
-        capture_output=True,
+    current_args = list(args)
+    last_session_id: str | None = None
+
+    for attempt in range(_MAX_NETWORK_RETRIES + 1):
+        attempt_output = (
+            output if attempt == 0
+            else output.with_name(f"{output.stem}-netretry{attempt}{output.suffix}")
+        )
+
+        result = subprocess.run(
+            ["claude", *current_args, "--output-format", "json"],
+            cwd=cwd,
+            env=env,
+            text=True,
+            capture_output=True,
+        )
+        text = result.stdout
+        session_id: str | None = None
+        try:
+            data = json.loads(result.stdout)
+            text = data.get("result", result.stdout)
+            session_id = data.get("session_id")
+        except (json.JSONDecodeError, AttributeError):
+            pass
+        if session_id:
+            last_session_id = session_id
+
+        attempt_output.write_text(
+            "STDOUT:\n" + result.stdout + "\nSTDERR:\n" + result.stderr,
+            encoding="utf-8",
+        )
+
+        if result.returncode == 0:
+            return text, session_id
+
+        combined = (result.stdout or "") + "\n" + (result.stderr or "")
+        if attempt < _MAX_NETWORK_RETRIES and _is_transient_claude_error(combined):
+            backoff = _NETWORK_BACKOFF_SECONDS[
+                min(attempt, len(_NETWORK_BACKOFF_SECONDS) - 1)
+            ]
+            resume_hint = (
+                f", resuming {last_session_id[:8]}…" if last_session_id else ""
+            )
+            print(
+                f"  ↻ Transient Claude API error{resume_hint}; sleeping {backoff}s "
+                f"then retry ({attempt + 1}/{_MAX_NETWORK_RETRIES}). "
+                f"See {attempt_output}"
+            )
+            time.sleep(backoff)
+            if last_session_id:
+                current_args = _build_resume_retry_args(args, last_session_id)
+            continue
+
+        raise RuntimeError(
+            f"Claude subprocess failed ({result.returncode}). See {attempt_output}"
+        )
+
+    raise RuntimeError(
+        f"Claude subprocess failed after {_MAX_NETWORK_RETRIES} network retries. "
+        f"See {output}"
     )
-    text = result.stdout
-    session_id: str | None = None
-    try:
-        data = json.loads(result.stdout)
-        text = data.get("result", result.stdout)
-        session_id = data.get("session_id")
-    except (json.JSONDecodeError, AttributeError):
-        pass
-    output.write_text(
-        "STDOUT:\n" + result.stdout + "\nSTDERR:\n" + result.stderr,
-        encoding="utf-8",
-    )
-    if result.returncode != 0:
-        raise RuntimeError(f"Claude subprocess failed ({result.returncode}). See {output}")
-    return text, session_id
 
 
 def run_claude_optimizer(
