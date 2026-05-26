@@ -244,82 +244,57 @@ def copy_out_policy(data_home: Path) -> None:
 
 def write_optimizer_permissions(data_home: Path) -> None:
     """
-    生成 experiments/<exp>/.claude/settings.local.json，让 optimizer subprocess
-    （cwd=data_home）启动时读到 deny 规则，无法 Read/Glob/Grep 兄弟实验和归档。
+    生成 experiments/<exp>/.claude/settings.local.json。
 
-    设计要点：
-    - allow 列表覆盖 optimizer 日常需要的命令（python 跑 eval、git 只读、cd / ls / cat
-      等基础工具），用 dontAsk 模式自动批准；不在列表里的工具会自动拒绝
-    - deny 列表枚举当前所有 sibling 实验目录 + 旧 monolithic 仓归档目录
-    - 用绝对路径（//... 双斜杠开头）保证匹配正确
-    - 禁用 disableBypassPermissionsMode，杜绝 optimizer 自行切到 bypass
+    分层防御：
+    1. permission 层：Edit/Write 精确到 policy slot + 自己的 exp dir；
+       trainer .py 显式 Edit deny；Bash 工具整体放行（边界由 sandbox 收）。
+    2. sandbox 层（OS 级 Seatbelt/bubblewrap）：
+       - autoAllowBashIfSandboxed: bash 子进程不再被 prefix 规则拒，
+         复合命令 / 重定向 / heredoc / run_in_background 一概放行。
+       - filesystem.denyRead 整个 experiments/ + ARCHIVE，allowRead 只开自己 exp dir，
+         即使 bash 用 `python -c "open(...)"` 也读不到兄弟实验数据。
+       - sandbox 默认只让写 cwd（即 exp dir）；trainer dir 的写入靠 Edit allow
+         路径同步成 sandbox allowWrite，Edit deny 同步成 sandbox denyWrite。
 
-    限制（已知 + 接受）：
-    - Bash(python *) 太宽，optimizer 可通过 python -c "open('禁止路径')" 绕过
-      Read 的 deny；这只能 OS 级 sandbox 才能彻底防
-    - allow 里 python 的绝对路径包含开发者 homedir，所以 settings.local.json
-      跨机器不可移植；但每次 train.py 启动都重新生成，所以不是问题
+    回归测试见 tests/test_sandbox.py（pytest -m sandbox）。
     """
-    base = data_home.parent  # DATA_HOME_BASE
-    siblings = sorted(
-        p for p in base.iterdir()
-        if p.is_dir() and p != data_home and not p.name.startswith(".")
+    # snake_hl/ 下除 policy.py 之外的所有 .py 都要 deny edit；
+    # 动态枚举避免未来加新 trainer 模块时手动维护。
+    trainer_pkg = ROOT / "snake_hl"
+    trainer_deny_edits = sorted(
+        p for p in trainer_pkg.glob("*.py") if p.name != "policy.py"
     )
 
-    # CC 权限语义：allow 优先于 deny。
-    # 所以不用 deny 来保护 trainer 文件——而是把 Edit/Write 的 allow 收窄到
-    # 精确路径（policy slot + 自己的 exp dir）。不在 allow 里的路径，
-    # dontAsk 模式直接自动拒绝，无需 deny 兜底。
-    # sibling read deny 保留（尽管 broad Read allow 可能覆盖它），至少起文档作用。
     deny: list[str] = []
-    # 兄弟实验：Read/Glob/Grep deny（best-effort；CC 绝对路径用 // 双斜杠开头）
-    for sib in siblings:
-        deny.append(f"Read(/{sib}/**)")
-        deny.append(f"Glob(/{sib}/**)")
-        deny.append(f"Grep(/{sib}/**)")
-    # 归档目录
+    for py in trainer_deny_edits:
+        deny.append(f"Edit(/{py})")
+    deny.append(f"Edit(/{ROOT}/train.py)")
+    # 旧 monolithic 仓归档目录：sandbox.denyRead 是主防线，permission Read deny
+    # 同时挡 CC 内置 Read/Glob/Grep 工具。
     if ARCHIVE_DIR.exists():
         deny.append(f"Read(/{ARCHIVE_DIR}/**)")
         deny.append(f"Glob(/{ARCHIVE_DIR}/**)")
         deny.append(f"Grep(/{ARCHIVE_DIR}/**)")
-        deny.append("Bash(*snake-arena-hl-archive*)")
 
     allow = [
-        # Python：用绝对路径锁定到 trainer venv
-        f"Bash({VENV_PYTHON} *)",
-        "Bash(python *)",
-        "Bash(python3 *)",
-        # 只读 git
-        "Bash(git status)",
-        "Bash(git diff *)",
-        "Bash(git log *)",
-        "Bash(git show *)",
-        "Bash(git blame *)",
-        # 浏览 / 小操作（不含 rm）
-        "Bash(ls *)",
-        "Bash(cat *)",
-        "Bash(head *)",
-        "Bash(tail *)",
-        "Bash(grep *)",
-        "Bash(find *)",
-        "Bash(wc *)",
-        "Bash(mkdir *)",
-        "Bash(touch *)",
-        "Bash(cp *)",
-        "Bash(mv *)",
-        "Bash(cd *)",
-        "Bash(echo *)",
-        # Edit/Write：精确路径，不用裸 "Edit"（裸 allow 会覆盖所有 deny）
-        # // 开头 = 绝对路径（文档规定：/path 是相对项目根，//path 才是绝对路径）
+        # Bash / Monitor 整体放行；真实边界由 sandbox 在 OS 层强制。
+        "Bash",
+        "Monitor",
+        # Edit/Write：精确路径。// 开头 = 绝对路径（/path 是项目根相对）。
         f"Edit(/{POLICY_SLOT})",
         f"Write(/{POLICY_SLOT})",
         f"Edit(/{data_home}/**)",
         f"Write(/{data_home}/**)",
-        # Read：保持宽松（读不如写危险；dontAsk 下 sibling deny best-effort）
+        # Read：CC 内置 Read 工具整体放行；sibling 实验由 sandbox.denyRead 隔离。
         "Read",
         "Glob",
         "Grep",
     ]
+
+    sandbox_deny_read = [str(DATA_HOME_BASE)]
+    if ARCHIVE_DIR.exists():
+        sandbox_deny_read.append(str(ARCHIVE_DIR))
 
     settings = {
         "permissions": {
@@ -327,7 +302,17 @@ def write_optimizer_permissions(data_home: Path) -> None:
             "allow": allow,
             "deny": deny,
             "disableBypassPermissionsMode": "disable",
-        }
+        },
+        "sandbox": {
+            "enabled": True,
+            "autoAllowBashIfSandboxed": True,
+            "allowUnsandboxedCommands": False,
+            "failIfUnavailable": True,
+            "filesystem": {
+                "denyRead": sandbox_deny_read,
+                "allowRead": [str(data_home)],
+            },
+        },
     }
 
     claude_dir = data_home / ".claude"
