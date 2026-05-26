@@ -177,6 +177,10 @@ def reload_policy_modules() -> None:
     importlib.reload(policy_module)
     importlib.reload(eval_module)
     importlib.reload(failure_report_module)
+    # replay.POLICIES["current"] 在模块加载时绑定了旧函数对象；
+    # 原地更新 dict，html_replay 持有的同一引用会自动看到新函数。
+    import snake_hl.replay as _replay_mod
+    _replay_mod.POLICIES["current"] = policy_module.choose_action
 
 
 def load_dotenv(path: Path = ROOT / ".env") -> dict[str, str]:
