@@ -569,15 +569,6 @@ def snapshot_round_artifacts(round_dir: Path, data_home: Path) -> None:
 # ============================================================
 
 
-def require_claude_env() -> None:
-    env = claude_env()
-    api_key = env.get("ANTHROPIC_API_KEY")
-    if not api_key or api_key == "replace-with-your-api-key":
-        raise RuntimeError(
-            "Missing required environment variable: ANTHROPIC_API_KEY. "
-            "Put it in .env or export it before running optimizer mode."
-        )
-
 
 def _run_claude(
     args: list[str],
@@ -588,7 +579,6 @@ def _run_claude(
     底层：执行 claude 子进程，--output-format json，返回 (text_result, session_id)。
     args 是 claude 命令行参数（不含 "claude" 本身）。
     """
-    require_claude_env()
     env = claude_env()
     result = subprocess.run(
         ["claude", *args, "--output-format", "json"],
