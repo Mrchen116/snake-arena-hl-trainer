@@ -23,3 +23,7 @@ include = ["snake_hl*"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 pythonpath = ["."]
+markers = [
+  "sandbox: opt-in tests that spawn `claude` CLI subprocesses to verify the optimizer permission/sandbox config. Costs API tokens and needs macOS/Linux with sandbox support. Run explicitly: pytest -m sandbox.",
+]
+addopts = "-m 'not sandbox'"
