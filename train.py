@@ -551,10 +551,14 @@ def _run_claude(
         )
         text = result.stdout
         session_id: str | None = None
+        is_error: bool | None = None
+        json_parsed = False
         try:
             data = json.loads(result.stdout)
             text = data.get("result", result.stdout)
             session_id = data.get("session_id")
+            is_error = bool(data.get("is_error", False))
+            json_parsed = True
         except (json.JSONDecodeError, AttributeError):
             pass
         if session_id:
@@ -565,11 +569,17 @@ def _run_claude(
             encoding="utf-8",
         )
 
-        if result.returncode == 0:
+        # 失败判定：优先看 is_error（JSON 语义），fallback 看 returncode（JSON 没解析出来）。
+        failed = (is_error if json_parsed else result.returncode != 0)
+        if not failed:
             return text, session_id
 
-        combined = (result.stdout or "") + "\n" + (result.stderr or "")
-        if attempt < _MAX_NETWORK_RETRIES and _is_transient_claude_error(combined):
+        # 瞬时判定：JSON 解析成功时只看 result 字段（窄、信噪比高）；
+        # JSON 没解出来时回退到 stdout+stderr。
+        error_text = text if json_parsed else (
+            (result.stdout or "") + "\n" + (result.stderr or "")
+        )
+        if attempt < _MAX_NETWORK_RETRIES and _is_transient_claude_error(error_text):
             backoff = _NETWORK_BACKOFF_SECONDS[
                 min(attempt, len(_NETWORK_BACKOFF_SECONDS) - 1)
             ]
