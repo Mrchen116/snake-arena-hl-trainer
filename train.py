@@ -265,10 +265,13 @@ def write_optimizer_permissions(data_home: Path) -> None:
         if p.is_dir() and p != data_home and not p.name.startswith(".")
     )
 
+    # CC 权限语义：allow 优先于 deny。
+    # 所以不用 deny 来保护 trainer 文件——而是把 Edit/Write 的 allow 收窄到
+    # 精确路径（policy slot + 自己的 exp dir）。不在 allow 里的路径，
+    # dontAsk 模式直接自动拒绝，无需 deny 兜底。
+    # sibling read deny 保留（尽管 broad Read allow 可能覆盖它），至少起文档作用。
     deny: list[str] = []
-    # 兄弟实验：全套 CC 文件工具都 deny。
-    # CC 绝对路径模式用 // 开头（双斜杠），而 Path 转字符串后已经以 / 开头，
-    # 所以 f-string 写 `Read(/{path}/**)` —— 单斜杠 + 已含 / 的绝对路径 = 双斜杠。
+    # 兄弟实验：Read/Glob/Grep deny（best-effort；CC 绝对路径用 // 双斜杠开头）
     for sib in siblings:
         deny.append(f"Read(/{sib}/**)")
         deny.append(f"Glob(/{sib}/**)")
@@ -279,25 +282,6 @@ def write_optimizer_permissions(data_home: Path) -> None:
         deny.append(f"Glob(/{ARCHIVE_DIR}/**)")
         deny.append(f"Grep(/{ARCHIVE_DIR}/**)")
         deny.append("Bash(*snake-arena-hl-archive*)")
-    # 禁止 optimizer 编辑 trainer 代码（双保险：hash 检查还在）
-    forbidden_edits = [
-        ROOT / "snake_hl" / "env.py",
-        ROOT / "snake_hl" / "eval.py",
-        ROOT / "snake_hl" / "baselines.py",
-        ROOT / "snake_hl" / "failure_report.py",
-        ROOT / "snake_hl" / "html_replay.py",
-        ROOT / "snake_hl" / "replay.py",
-        ROOT / "snake_hl" / "baseline_snapshot.py",
-        ROOT / "snake_hl" / "__init__.py",
-        ROOT / "train.py",
-        ROOT / "AGENTS.md",
-        ROOT / "README.md",
-        ROOT / "EVAL_PROTOCOL.md",
-        ROOT / "pyproject.toml",
-    ]
-    for path in forbidden_edits:
-        deny.append(f"Edit({path})")
-        deny.append(f"Write({path})")
 
     allow = [
         # Python：用绝对路径锁定到 trainer venv
@@ -324,9 +308,12 @@ def write_optimizer_permissions(data_home: Path) -> None:
         "Bash(mv *)",
         "Bash(cd *)",
         "Bash(echo *)",
-        # CC 内置工具
-        "Edit",
-        "Write",
+        # Edit/Write：精确路径，不用裸 "Edit"（裸 allow 会覆盖所有 deny）
+        f"Edit({POLICY_SLOT})",
+        f"Write({POLICY_SLOT})",
+        f"Edit(/{data_home}/**)",
+        f"Write(/{data_home}/**)",
+        # Read：保持宽松（读不如写危险；dontAsk 下 sibling deny best-effort）
         "Read",
         "Glob",
         "Grep",
@@ -415,7 +402,8 @@ trainer 侧（绝对路径）：
 # 禁止事项
 
 - 不要编辑 trainer 代码（{ROOT}/snake_hl/env.py、eval.py、baselines.py、train.py 等）。
-  这些已经在 .claude/settings.local.json 里 deny 掉，CC 工具层会直接拒绝。
+  settings.local.json 里的 Edit/Write allow 只覆盖 policy.py 和本实验目录，
+  其他路径在 dontAsk 模式下会被 CC 工具层自动拒绝。
 - 不要硬编码特定 seed、replay 路径或当前 worst cases。
 - 本轮不要针对 eval 做优化（eval 是 held-out）。
 - 不要尝试读取你 cwd 之外的其他实验数据目录（已通过 deny 规则隔离）。
