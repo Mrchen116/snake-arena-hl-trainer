@@ -923,8 +923,12 @@ def run_round(
             break  # 边界合规 + 分数够 → 成功
 
         if attempt >= MAX_FEEDBACK:
-            print(f"  ✗ 反馈循环耗尽（{MAX_FEEDBACK} 次），接受当前结果。")
-            break
+            raise RuntimeError(
+                f"Optimizer failed after {MAX_FEEDBACK} feedback attempts. "
+                f"Last improvement: {improvement:+.3f} (target: +{MIN_IMPROVEMENT}). "
+                f"Violations in last attempt: {violations or 'none'}. "
+                f"Inspect round dir: {round_dir}"
+            )
 
         feedback_msg = "\n\n---\n\n".join(feedback_parts)
 
