@@ -8,10 +8,8 @@ __pycache__/
 *.pyc
 *.egg-info/
 
-# Per-experiment data. train.py copies experiments/<exp>/policy.py into the
-# snake_hl/policy.py slot at start, copies back at end of each round. Both
-# locations are local-only scratch from the trainer's perspective.
-snake_hl/policy.py
+# Per-experiment data. Each experiment owns its policy.py + notes + runs;
+# trainer-side has no global runtime slot anymore.
 experiments/
 !experiments/_baseline/
 !experiments/_baseline/policy.py

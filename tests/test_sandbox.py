@@ -37,17 +37,16 @@ pytestmark = [
 
 
 def _build_settings(trainer_dir: Path, exp_dir: Path, sibling_dir: Path) -> dict:
-    """Mirror the production scheme: Bash allow + Edit allow/deny on specific
-    paths, sandbox.filesystem only sets read isolation (writes are governed by
-    Edit allow/deny which Claude Code merges into the sandbox boundary)."""
+    """Mirror the production scheme: Bash allow + Edit/Write only on the exp dir
+    (which contains policy.py), trainer paths are Edit deny. sandbox.filesystem
+    sets read isolation; writes are governed by Edit allow/deny which Claude Code
+    merges into the sandbox boundary."""
     return {
         "permissions": {
             "defaultMode": "dontAsk",
             "allow": [
                 "Bash",
                 "Monitor",
-                f"Edit(//{trainer_dir}/policy.py)",
-                f"Write(//{trainer_dir}/policy.py)",
                 f"Edit(//{exp_dir}/**)",
                 f"Write(//{exp_dir}/**)",
                 "Read",
@@ -82,9 +81,9 @@ def sandbox_env(tmp_path: Path) -> dict:
     Layout:
         tmp/
           trainer/        # stands in for repo's snake_hl/
-            env.py        # denied (stands in for env.py, eval.py, ...)
-            policy.py     # allowed (the editable slot)
+            env.py        # denied (stands in for env.py, eval.py, policy_runtime.py, ...)
           exp/            # cwd for the claude subprocess
+            policy.py     # allowed (the editable experiment file)
             .claude/settings.local.json
           sibling-exp/    # stands in for another experiment dir
             secret.txt    # must NOT be readable from exp/
@@ -92,10 +91,10 @@ def sandbox_env(tmp_path: Path) -> dict:
     trainer_dir = tmp_path / "trainer"
     trainer_dir.mkdir()
     (trainer_dir / "env.py").write_text("# fake env.py: must remain unchanged\n")
-    (trainer_dir / "policy.py").write_text("# fake policy.py\n_X = 1\n")
 
     exp_dir = tmp_path / "exp"
     exp_dir.mkdir()
+    (exp_dir / "policy.py").write_text("# fake policy.py\n_X = 1\n")
 
     sibling_dir = tmp_path / "sibling-exp"
     sibling_dir.mkdir()
@@ -250,21 +249,21 @@ def test_sibling_read_blocked(sandbox_env: dict) -> None:
 
 
 def test_policy_py_writable_via_bash(sandbox_env: dict) -> None:
-    """policy.py is in Edit allow, which propagates to sandbox allowWrite."""
-    policy = sandbox_env["trainer_dir"] / "policy.py"
+    """policy.py lives in exp_dir; Edit allow covers exp_dir/** → sandbox allowWrite."""
+    policy = sandbox_env["exp_dir"] / "policy.py"
     prompt = (
         f"Use the Bash tool to run: `echo '# bash-marker' >> {policy}`. "
         "Report only success or blocked."
     )
     _run_claude(prompt, sandbox_env["exp_dir"])
     assert "# bash-marker" in policy.read_text(), (
-        "expected bash append to policy.py to succeed (Edit allow → sandbox allowWrite)"
+        "expected bash append to exp_dir/policy.py to succeed (Edit allow → sandbox allowWrite)"
     )
 
 
 def test_policy_py_editable_via_edit_tool(sandbox_env: dict) -> None:
-    """Edit tool path: builtin file tool obeys permission Edit allow."""
-    policy = sandbox_env["trainer_dir"] / "policy.py"
+    """Edit tool path: builtin file tool obeys permission Edit allow on exp_dir/**."""
+    policy = sandbox_env["exp_dir"] / "policy.py"
     prompt = (
         f"Use the Edit tool on {policy} to change `_X = 1` to `_X = 42`. "
         "Report only whether Edit succeeded."

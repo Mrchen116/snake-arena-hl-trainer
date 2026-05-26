@@ -6,11 +6,11 @@ from collections import Counter
 from pathlib import Path
 from statistics import mean
 
-from snake_hl import baselines, policy
+from snake_hl import baselines, policy_runtime
 from snake_hl.env import EpisodeResult, simulate_episode
 
 POLICIES = {
-    "current": policy.choose_action,
+    "current": policy_runtime.choose_action,
     "random": baselines.random_policy,
     "greedy": baselines.greedy_policy,
     "safe_greedy": baselines.safe_greedy_policy,

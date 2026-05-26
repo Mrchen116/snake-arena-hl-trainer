@@ -8,42 +8,38 @@ from __future__ import annotations
 #   ├── train.py
 #   ├── snake_hl/                          trainer modules
 #   │   ├── env.py, eval.py, baselines.py, ...
-#   │   └── policy.py                      ← 运行槽（gitignored，由 train.py 在每次启动时
-#   │                                         从 experiments/<exp>/policy.py 拷贝填充）
-#   ├── experiments/                       ← gitignored 整体
+#   │   └── policy_runtime.py              ← 动态 loader，读 SNAKE_POLICY_PATH
+#   ├── experiments/                       ← gitignored
 #   │   ├── <exp-A>/                       ← 一个实验 = 一个目录（可独立 git）
-#   │   │   ├── policy.py                  canonical 持久态
+#   │   │   ├── policy.py                  ← canonical state + runtime（agent 直接 edit）
 #   │   │   ├── heuristic_notes.md
 #   │   │   ├── runs/, replays/, reports/
 #   │   │   ├── trials.jsonl, training_curve.{json,html}
-#   │   │   └── .claude/settings.local.json   train.py 启动时重新生成，deny 兄弟实验
+#   │   │   └── .claude/settings.local.json   train.py 启动时重新生成
 #   │   └── <exp-B>/ ...
 #   └── tests/
 #
-# 工作流：
-#   1. train.py 启动时：单文件 copy_in，把 experiments/<exp>/policy.py → snake_hl/policy.py
-#   2. 写 experiments/<exp>/.claude/settings.local.json（动态枚举当前 siblings）
-#   3. 启动 optimizer subprocess，cwd=experiments/<exp>/
-#      - optimizer 读到 cwd 下的 .claude/settings.local.json，被 deny 访问兄弟实验
-#      - optimizer 编辑 trainer 的 snake_hl/policy.py（绝对路径）；其他 data 文件用 cwd 相对
-#   4. 每轮结束：单文件 copy_out，把 snake_hl/policy.py → experiments/<exp>/policy.py
+# 工作流（无全局 slot，支持多实验并发）：
+#   1. train.py 启动：os.environ["SNAKE_POLICY_PATH"] = experiments/<exp>/policy.py
+#   2. trainer-side import snake_hl.eval / failure_report / replay 时，
+#      policy_runtime 通过该 env var 加载本 exp 的 policy 文件
+#   3. 写 experiments/<exp>/.claude/settings.local.json（动态枚举 trainer 模块 + siblings）
+#   4. 启动 optimizer subprocess，cwd=experiments/<exp>/，env 继承 SNAKE_POLICY_PATH
+#      - optimizer 直接编辑 cwd 下的 policy.py（即 experiments/<exp>/policy.py）
+#      - 其他 trainer 路径被 settings + sandbox 双层 deny
+#   5. 每轮结束：policy_runtime.reload() 让 trainer 进程内 import 看到新代码
 #
-# 安全设计：
-#   - settings.local.json 落在 exp 目录而不是 trainer 根，避免影响开发者自己的 CC 会话
-#   - --permission-mode dontAsk + 显式 allow 列表，禁用 bypass mode
-#   - hash-based 边界检查（仍保留作为 belt-and-braces）
+# 并发安全：每个 train.py 进程关心自己的 SNAKE_POLICY_PATH。不再有共享 slot。
 #
 # 【DL 类比】
-#   模型参数 (weights)    snake_hl/policy.py（运行槽，每轮从 exp 拷入、拷出）
+#   模型参数 (weights)    experiments/<exp>/policy.py（canonical + runtime 合二为一）
 #   损失函数 (loss)       -avg_score
 #   优化器 (optimizer)    Claude Code CLI
 #   一个 epoch            一轮 run_round()
-#   模型检查点            每轮 copy_out 持久化到 experiments/<exp>/policy.py
+#   模型检查点            每轮结束在 runs/<ts>/round-NN/policy.py 留快照
 # ============================================================
 
 import argparse
-import hashlib
-import importlib
 import json
 import os
 import shutil
@@ -51,32 +47,29 @@ import subprocess
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Iterable
 
 from dotenv import dotenv_values
 
-# snake_hl.eval / failure_report / policy 都需要 snake_hl/policy.py 存在才能 import。
-# train.py 启动早期要先做 copy_in 才能让这些模块可用，所以延迟 import。
+# 这三个模块都依赖 SNAKE_POLICY_PATH，main() 设好 env 后才 import。
 eval_module = None  # type: ignore
 failure_report_module = None  # type: ignore
-policy_module = None  # type: ignore
+policy_runtime_module = None  # type: ignore
 
 
 def _load_snake_hl_modules() -> None:
-    """在 copy_in() 之后调用，把 snake_hl.* 三个模块绑到全局。"""
-    global eval_module, failure_report_module, policy_module
+    """SNAKE_POLICY_PATH 设置好之后调用，绑定 trainer-side 模块到全局。"""
+    global eval_module, failure_report_module, policy_runtime_module
     from snake_hl import eval as _em
     from snake_hl import failure_report as _frm
-    from snake_hl import policy as _pm
+    from snake_hl import policy_runtime as _prm
     eval_module = _em
     failure_report_module = _frm
-    policy_module = _pm
+    policy_runtime_module = _prm
 
 
 ROOT = Path(__file__).resolve().parent
 
-# 实验数据目录根。固定在 trainer 内部，不允许通过环境变量覆盖（参考 settings.local.json
-# 提供路径泄露的考量：把这个常量留在源码里是 OK 的，因为不暴露具体实验名）。
+# 实验数据目录根。固定在 trainer 内部，不允许通过环境变量覆盖。
 DATA_HOME_BASE = ROOT / "experiments"
 
 # Trainer venv 的 python 绝对路径，optimizer prompt + permissions allow 列表都要用到
@@ -85,70 +78,9 @@ VENV_PYTHON = ROOT / ".venv" / "bin" / "python"
 # 旧 monolithic 仓的归档目录。出现时连同兄弟实验一起 deny。
 ARCHIVE_DIR = Path.home() / "Repos" / "snake-arena-hl-archive"
 
-# 单文件 cp：optimizer 编辑 snake_hl/policy.py 这个运行槽，每轮结束 copy_out 回 exp。
-# 其他 data 文件（heuristic_notes、runs、replays、reports 等）都直接在
-# experiments/<exp>/ 下读写，不再有 trainer-side 运行槽。
-POLICY_SLOT = ROOT / "snake_hl" / "policy.py"
-
-# Hash-based 边界检查白名单。只剩 policy.py，因为其他 data 文件都在 experiments/ 下
-# （被 IGNORED_SNAPSHOT_PARTS 排除），不会进入 hash 比对。
-ALLOWED_OPTIMIZER_EDITS = {
-    "snake_hl/policy.py",
-}
-
-# Hash 快照时跳过这些目录或前缀
-IGNORED_SNAPSHOT_PARTS = {
-    ".git",
-    ".venv",
-    ".pytest_cache",
-    "__pycache__",
-    "snake_arena_hl.egg-info",
-    ".DS_Store",   # macOS Finder 自动生成，不是 optimizer 写的
-    "experiments",  # data 目录整个跳过，optimizer 在里面的活动不受 hash 检查
-}
-
 
 def utc_stamp() -> str:
     return datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-
-
-def repo_path(path: Path) -> str:
-    """trainer 内部相对路径（用于日志显示）。"""
-    path = path if path.is_absolute() else ROOT / path
-    try:
-        return path.relative_to(ROOT).as_posix()
-    except ValueError:
-        return str(path)
-
-
-def should_snapshot(path: Path) -> bool:
-    relative = path.relative_to(ROOT)
-    parts = set(relative.parts)
-    if parts & IGNORED_SNAPSHOT_PARTS:
-        return False
-    return path.is_file()
-
-
-def file_digest(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
-
-
-def snapshot_repo() -> dict[str, str]:
-    """对 trainer dir（排除 experiments/、缓存等）生成 {相对路径: 哈希}。"""
-    return {
-        repo_path(path): file_digest(path)
-        for path in ROOT.rglob("*")
-        if should_snapshot(path)
-    }
-
-
-def changed_files(before: dict[str, str], after: dict[str, str]) -> list[str]:
-    paths = set(before) | set(after)
-    return sorted(path for path in paths if before.get(path) != after.get(path))
 
 
 def run_command(args: list[str], *, output: Path | None = None, cwd: Path | None = None) -> subprocess.CompletedProcess[str]:
@@ -174,14 +106,12 @@ def write_json(path: Path, payload: object) -> None:
 
 
 def reload_policy_modules() -> None:
-    """重 import policy 模块，让 optimizer 的改动在本进程内生效。"""
-    importlib.reload(policy_module)
-    importlib.reload(eval_module)
-    importlib.reload(failure_report_module)
-    # replay.POLICIES["current"] 在模块加载时绑定了旧函数对象；
-    # 原地更新 dict，html_replay 持有的同一引用会自动看到新函数。
-    import snake_hl.replay as _replay_mod
-    _replay_mod.POLICIES["current"] = policy_module.choose_action
+    """Optimizer 编辑 policy.py 后，让 trainer 进程内 import 看到新代码。
+
+    eval.POLICIES["current"] 持有的是 policy_runtime.choose_action 这个函数对象，
+    内部按 lookup-on-call 方式读 policy_runtime._module，所以只需 reload runtime。
+    """
+    policy_runtime_module.reload()
 
 
 def load_dotenv(path: Path = ROOT / ".env") -> dict[str, str]:
@@ -192,9 +122,7 @@ def claude_env() -> dict[str, str]:
     """构造 Claude CLI 子进程的环境变量。
 
     .env 提供默认值，shell 当前 environment 覆盖。
-    不在 trainer 源码里硬编码任何 provider/base-URL/model—— 这些都从 .env 读。
-    支持的 vars 见 .env.example（ANTHROPIC_API_KEY 必填，BASE_URL / model overrides 等
-    取决于使用 Kimi / Mimo / 官方 API 哪一家）。
+    SNAKE_POLICY_PATH 由 main() 写入 os.environ，所以这里自动透传给子进程。
     """
     return {**load_dotenv(), **os.environ}
 
@@ -203,7 +131,7 @@ MIN_IMPROVEMENT = 2.0
 
 
 # ============================================================
-# 实验目录 ↔ trainer 运行槽 同步（仅 policy.py）
+# 实验目录校验
 # ============================================================
 
 
@@ -223,20 +151,6 @@ def validate_data_home(data_home: Path) -> None:
         raise RuntimeError(f"Required file missing in data dir: {policy_file}")
 
 
-def copy_in_policy(data_home: Path) -> None:
-    """启动时把 experiments/<exp>/policy.py 拷到 snake_hl/policy.py 运行槽。"""
-    src = data_home / "policy.py"
-    POLICY_SLOT.parent.mkdir(parents=True, exist_ok=True)
-    shutil.copy2(src, POLICY_SLOT)
-
-
-def copy_out_policy(data_home: Path) -> None:
-    """每轮结束把运行槽里的 policy.py 写回 experiments/<exp>/policy.py。"""
-    if not POLICY_SLOT.exists():
-        return
-    shutil.copy2(POLICY_SLOT, data_home / "policy.py")
-
-
 # ============================================================
 # Optimizer 权限配置
 # ============================================================
@@ -247,24 +161,21 @@ def write_optimizer_permissions(data_home: Path) -> None:
     生成 experiments/<exp>/.claude/settings.local.json。
 
     分层防御：
-    1. permission 层：Edit/Write 精确到 policy slot + 自己的 exp dir；
-       trainer .py 显式 Edit deny；Bash 工具整体放行（边界由 sandbox 收）。
+    1. permission 层：Edit/Write 精确到自己的 exp dir（含 policy.py）；
+       trainer .py 全部 Edit deny；Bash 工具整体放行（边界由 sandbox 收）。
     2. sandbox 层（OS 级 Seatbelt/bubblewrap）：
        - autoAllowBashIfSandboxed: bash 子进程不再被 prefix 规则拒，
          复合命令 / 重定向 / heredoc / run_in_background 一概放行。
        - filesystem.denyRead 整个 experiments/ + ARCHIVE，allowRead 只开自己 exp dir，
          即使 bash 用 `python -c "open(...)"` 也读不到兄弟实验数据。
-       - sandbox 默认只让写 cwd（即 exp dir）；trainer dir 的写入靠 Edit allow
-         路径同步成 sandbox allowWrite，Edit deny 同步成 sandbox denyWrite。
+       - sandbox 默认只让写 cwd（即 exp dir）；trainer dir 的 Edit deny
+         同步成 sandbox denyWrite。
 
     回归测试见 tests/test_sandbox.py（pytest -m sandbox）。
     """
-    # snake_hl/ 下除 policy.py 之外的所有 .py 都要 deny edit；
-    # 动态枚举避免未来加新 trainer 模块时手动维护。
+    # 所有 trainer .py 都禁止编辑（包括 policy_runtime.py）
     trainer_pkg = ROOT / "snake_hl"
-    trainer_deny_edits = sorted(
-        p for p in trainer_pkg.glob("*.py") if p.name != "policy.py"
-    )
+    trainer_deny_edits = sorted(trainer_pkg.glob("*.py"))
 
     deny: list[str] = []
     for py in trainer_deny_edits:
@@ -281,9 +192,7 @@ def write_optimizer_permissions(data_home: Path) -> None:
         # Bash / Monitor 整体放行；真实边界由 sandbox 在 OS 层强制。
         "Bash",
         "Monitor",
-        # Edit/Write：精确路径。// 开头 = 绝对路径（/path 是项目根相对）。
-        f"Edit(/{POLICY_SLOT})",
-        f"Write(/{POLICY_SLOT})",
+        # Edit/Write 只开 exp dir（包含 policy.py）。
         f"Edit(/{data_home}/**)",
         f"Write(/{data_home}/**)",
         # Read：CC 内置 Read 工具整体放行；sibling 实验由 sandbox.denyRead 隔离。
@@ -337,19 +246,15 @@ def build_optimizer_prompt(
     failure_report: Path,
 ) -> str:
     """
-    optimizer 的 cwd 是 data_home (experiments/<exp>/)，所以：
-    - trainer-side 引用全部用绝对路径（README.md / snake_hl/policy.py 等）
-    - data-side 引用用 cwd 相对路径（heuristic_notes.md / runs/<ts>/<round>/journal.md 等）
-    - 验证命令用 trainer venv 的绝对路径
+    optimizer 的 cwd 是 data_home (experiments/<exp>/)，policy.py 就在 cwd 下，
+    所以 "编辑 policy.py" 全用 cwd 相对引用。
+    trainer 代码（README/AGENTS）用绝对路径，验证命令用 trainer venv 绝对路径。
     """
     target_score = round(before_train["avg_score"] + MIN_IMPROVEMENT, 3)
-    # exp 内相对路径（用于 prompt 里 cwd-relative 引用）
     round_dir_in_exp = round_dir.relative_to(data_home).as_posix()
-    # trainer-side 绝对路径
     trainer_readme = ROOT / "README.md"
     trainer_agents = ROOT / "AGENTS.md"
     trainer_eval_protocol = ROOT / "EVAL_PROTOCOL.md"
-    trainer_policy = POLICY_SLOT
     trainer_tests = ROOT / "tests"
 
     return f"""你是 Snake Arena HL 这个 Heuristic Learning 闭环中的一轮优化器。
@@ -369,37 +274,31 @@ trainer 代码在 {ROOT}/ 下，相关引用都给绝对路径。
 
 # 必读项目文件
 
-trainer 侧（绝对路径）：
+trainer 侧（绝对路径，只读）：
 - {trainer_readme}
 - {trainer_eval_protocol}
 - {trainer_agents}
-- {trainer_policy}   ← 这是 trainer 的运行槽，**你要编辑的就是这个文件**
 
-本实验侧（cwd 相对）：
+本实验侧（cwd 相对，可读写）：
+- policy.py   ← **你要编辑的就是这个文件**（cwd 下，本实验的策略）
 - heuristic_notes.md
 - reports/train-failures.md
 
 # 允许修改的文件
 
-- **{trainer_policy}**（trainer 运行槽，绝对路径——你的所有 policy 改动都在这里）
+- **policy.py**（cwd 下，本实验的策略——你的所有 policy 改动都在这里）
 - heuristic_notes.md（cwd 相对，本实验的跨轮笔记）
 - {round_dir_in_exp}/journal.md（cwd 相对，本轮实验日志，下面有协议）
 - {round_dir_in_exp}/scripts/（cwd 相对，你保留的诊断脚本写这里）
 
 # 禁止事项
 
-- 不要编辑 trainer 代码（{ROOT}/snake_hl/env.py、eval.py、baselines.py、train.py 等）。
-  settings.local.json 里的 Edit/Write allow 只覆盖 policy.py 和本实验目录，
-  其他路径在 dontAsk 模式下会被 CC 工具层自动拒绝。
+- 不要编辑 trainer 代码（{ROOT}/snake_hl/*.py、train.py 等）。
+  settings.local.json 里的 Edit/Write allow 只覆盖本实验目录，
+  trainer 路径在 dontAsk 模式下会被 CC 工具层自动拒绝。
 - 不要硬编码特定 seed、replay 路径或当前 worst cases。
 - 本轮不要针对 eval 做优化（eval 是 held-out）。
 - 不要尝试读取你 cwd 之外的其他实验数据目录（已通过 deny 规则隔离）。
-
-# 关于 cwd 下的 policy.py
-
-注意：你的 cwd 下有一个 policy.py 文件（本实验 round 起点的版本），**不要编辑它**。
-那是 train.py 每轮结束 copy_out 时回写的目标文件，round 期间它是"陈旧的"，
-真正的运行槽是 {trainer_policy}。Edit 那里，不要 Edit 你 cwd 下的 policy.py。
 
 # 实验日志协议（必读，硬性要求）
 
@@ -420,7 +319,7 @@ trainer 侧（绝对路径）：
 # 累积进步
 
 目标 +{MIN_IMPROVEMENT} 可以是单次大改，也可以是多次小改的累积——由你判断
-哪种更适合当前情况。但请注意 session 结束时 {trainer_policy} 应该反映本轮
+哪种更适合当前情况。但请注意 session 结束时 cwd 下的 policy.py 应该反映本轮
 找到的"最好版本"，避免做完 N 次有效改动后因为最后一次失败连带丢掉前面的
 累积。何时落盘、何时合并由你决定，journal.md 里把每次改动的分数记清楚就好。
 
@@ -455,7 +354,7 @@ trainer 侧（绝对路径）：
   正确做法是写一个 python3 -c 内联脚本，在同一个 Python 进程里 monkey-patch
   目标函数为不同值，连续调用 evaluate() 多次，打印 (value, score) 列表。
   多个候选只占 1 次进程启动开销，节省 70% 以上 wall time。
-  找到 winner 后再用 Edit 一次性写入 {trainer_policy}。
+  找到 winner 后再用 Edit 一次性写入 policy.py。
 
 - **禁止 Edit→eval→revert 颠簸**：journal 里如果出现 3 次以上 "Edit A → eval →
   Edit A 回原值"，必须停下来用上面的批量扫描重做。
@@ -476,11 +375,14 @@ trainer 侧（绝对路径）：
 
 # 验收命令（cwd 是 {data_home}）
 
+trainer 子进程已通过 SNAKE_POLICY_PATH 环境变量指向 cwd 下的 policy.py，
+所以 `--policy current` 自动加载你正在编辑的文件。
+
 ```bash
 # pytest 在 trainer 那边，传 tests 目录的绝对路径让 pytest 找到测试
 {VENV_PYTHON} -m pytest {trainer_tests}
 
-# eval 默认使用当前运行槽（{trainer_policy}）
+# eval 默认使用 SNAKE_POLICY_PATH 指向的 policy.py（即 cwd 下的）
 {VENV_PYTHON} -m snake_hl.eval --policy current --split train
 
 # 刷新 failure report（写到你 cwd 下的 reports/train-failures.md）
@@ -549,13 +451,11 @@ def snapshot_round_artifacts(round_dir: Path, data_home: Path) -> None:
     把当轮结束时的 policy.py、heuristic_notes.md、replays 拷贝到 round_dir。
     类比 DL：每个 epoch 结束时存模型权重 checkpoint + 推理样本。
     """
-    # policy.py 来自 trainer 运行槽（当前最新）
-    shutil.copy2(POLICY_SLOT, round_dir / "policy.py")
-    # heuristic_notes.md 在 exp 目录
+    # policy.py 直接在 exp 目录里（没有运行槽了），从那里拷
+    shutil.copy2(data_home / "policy.py", round_dir / "policy.py")
     notes_src = data_home / "heuristic_notes.md"
     if notes_src.exists():
         shutil.copy2(notes_src, round_dir / "heuristic_notes.md")
-    # replays/current/ 在 exp 目录
     replays_src = data_home / "replays" / "current"
     replays_dst = round_dir / "replays"
     if replays_src.exists():
@@ -567,7 +467,6 @@ def snapshot_round_artifacts(round_dir: Path, data_home: Path) -> None:
 # ============================================================
 # Optimizer subprocess
 # ============================================================
-
 
 
 def _run_claude(
@@ -587,7 +486,6 @@ def _run_claude(
         text=True,
         capture_output=True,
     )
-    # 尝试解析 JSON，提取 result + session_id
     text = result.stdout
     session_id: str | None = None
     try:
@@ -610,7 +508,7 @@ def run_claude_optimizer(
 ) -> tuple[str, str | None]:
     """
     首次启动优化器。cwd 指向 experiments/<exp>/，optimizer 读到该目录下的
-    .claude/settings.local.json，Edit/Write 被限制在 policy slot + exp dir。
+    .claude/settings.local.json，Edit/Write 被限制在 exp dir（含 policy.py）。
 
     --permission-mode dontAsk：allow 列表内自动批准，不在列表里的自动拒绝。
     --model sonnet：alias 经由 ANTHROPIC_DEFAULT_SONNET_MODEL 重映射到 provider 模型。
@@ -636,7 +534,7 @@ def send_optimizer_feedback(
 ) -> tuple[str, str | None]:
     """
     用 --resume 把反馈发回给已有 session，让 optimizer 在完整上下文里继续改。
-    用于：边界违规（改了 trainer 代码）或分数不够时的迭代反馈。
+    用于：分数不够时的迭代反馈。
     """
     return _run_claude(
         [
@@ -649,23 +547,6 @@ def send_optimizer_feedback(
         output=output,
         cwd=cwd,
     )
-
-
-def find_boundary_violations(changes: Iterable[str]) -> list[str]:
-    """返回超出允许范围的变更文件列表（空列表 = 合规）。"""
-    return sorted(path for path in changes if path not in ALLOWED_OPTIMIZER_EDITS)
-
-
-def revert_boundary_violations(violations: list[str]) -> None:
-    """用 git checkout HEAD 把越界文件还原，让后续 eval 基于合法状态。"""
-    for path in violations:
-        subprocess.run(
-            ["git", "checkout", "HEAD", "--", path],
-            cwd=ROOT,
-            check=True,
-            capture_output=True,
-        )
-    print(f"  ↩ Reverted {len(violations)} boundary violation(s): {', '.join(violations)}")
 
 
 # ============================================================
@@ -697,12 +578,10 @@ def update_training_curve(
     global_round = len(records) + 1
     records.append({
         "round": global_round,
-        # Composite score
         "train_before": round(before_train["avg_score"], 3),
         "train_after": round(after_train["avg_score"], 3),
         "eval_after": round(after_eval["avg_score"], 3),
         "train_delta": round(after_train["avg_score"] - before_train["avg_score"], 3),
-        # Component metrics
         "train_food": round(after_train.get("avg_food", 0), 3),
         "eval_food": round(after_eval.get("avg_food", 0), 3),
         "train_survival": round(after_train.get("survival_rate", 0), 4),
@@ -711,13 +590,10 @@ def update_training_curve(
         "eval_steps": round(after_eval.get("avg_steps", 0), 2),
         "train_deaths": after_train.get("death_reasons", {}),
         "eval_deaths": after_eval.get("death_reasons", {}),
-        # Wall-clock
         "duration_seconds": round(duration_seconds, 1) if duration_seconds is not None else None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
     curve_json.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
-    # 不再每轮生成 HTML 也不维护 index 文件——dashboard/index.html 是静态 viewer，
-    # 直接 parse http.server 返回的 experiments/ 目录 listing 来发现实验。
 
 
 def start_dashboard_server(port: int = 8765) -> subprocess.Popen | None:
@@ -774,12 +650,11 @@ def run_round(
       ② 误差分析     生成 failure report = hard examples
       ③ 梯度信号     写 journal 模板 + 构建 prompt + 生成 .claude/settings.local.json
       ④ 参数更新     Claude 反复迭代直到 train 分超过基准
-      ⑤ 参数约束检查 hash 对比 trainer 代码
-      ⑥ 加载新参数   reload policy 模块
-      ⑦ 回归测试     pytest
-      ⑧ 训练集评分   after_train
-      ⑨ 验证集评分   eval split
-      ⑩ 存档         快照 + 训练曲线 + copy_out
+      ⑤ 加载新参数   policy_runtime.reload()
+      ⑥ 回归测试     pytest
+      ⑦ 训练集评分   after_train
+      ⑧ 验证集评分   eval split
+      ⑨ 存档         快照 + 训练曲线
     """
     round_dir = run_dir / f"round-{round_index:02d}"
     round_dir.mkdir(parents=True, exist_ok=True)
@@ -819,13 +694,11 @@ def run_round(
             "before_train": before_train,
         }
 
-    # ── ④⑤⑥⑦⑧ 优化 + 边界检查 + 评分（最多 MAX_FEEDBACK 次反馈循环）──────────
+    # ── ④⑤⑥⑦ 优化 + 评分（最多 MAX_FEEDBACK 次反馈循环）──────────
     MAX_FEEDBACK = 3
-    before_hashes = snapshot_repo()
     session_id: str | None = None
     after_train: dict = {}
     after_eval: dict = {}
-    optimizer_changes: list[str] = []
 
     for attempt in range(MAX_FEEDBACK + 1):
         output_file = round_dir / (
@@ -848,34 +721,13 @@ def run_round(
                 session_id, feedback_msg, output_file, cwd=data_home
             )
 
-        # ── ⑤ 边界检查 ─────────────────────────
-        after_hashes = snapshot_repo()
-        optimizer_changes = changed_files(before_hashes, after_hashes)
-        violations = find_boundary_violations(optimizer_changes)
-        feedback_parts: list[str] = []
-
-        if violations:
-            revert_boundary_violations(violations)
-            # 还原后重新计算 changes（violations 已被 revert）
-            after_hashes = snapshot_repo()
-            optimizer_changes = changed_files(before_hashes, after_hashes)
-            feedback_parts.append(
-                f"你刚才修改了以下不允许修改的文件，改动已被自动还原：\n"
-                + "\n".join(f"  - {v}" for v in violations)
-                + f"\n\n允许修改的文件只有：\n"
-                f"  - {POLICY_SLOT}（policy 运行槽）\n"
-                f"  - 你的实验目录下的文件（heuristic_notes.md, journal.md, scripts/ 等）\n"
-                f"\n请不要修改 trainer 代码（env.py、eval.py、baselines.py 等），"
-                f"只改 {POLICY_SLOT}，然后重新运行 eval 验证分数。"
-            )
-
-        # ── ⑥ 加载新参数 ────────────────────────
+        # ── ⑤ 加载新参数 ────────────────────────
         reload_policy_modules()
 
-        # ── ⑦ 回归测试 ──────────────────────────
+        # ── ⑥ 回归测试 ──────────────────────────
         run_command([sys.executable, "-m", "pytest"], output=round_dir / "pytest.txt")
 
-        # ── ⑧ 训练集评分 ────────────────────────
+        # ── ⑦ 训练集评分 ────────────────────────
         after_train, _ = eval_module.evaluate("current", "train")
         after_train["run_type"] = "train_after_optimizer"
         after_train["round"] = round_index
@@ -885,30 +737,26 @@ def run_round(
         improvement = after_train["avg_score"] - before_train["avg_score"]
         target_score = round(before_train["avg_score"] + MIN_IMPROVEMENT, 3)
 
-        if improvement < MIN_IMPROVEMENT:
-            feedback_parts.append(
-                f"当前 train avg_score = {after_train['avg_score']:.3f}，"
-                f"比本轮开始前提升了 {improvement:+.3f} 分，"
-                f"但目标是至少 +{MIN_IMPROVEMENT} 分（达到 {target_score}）。\n\n"
-                f"请继续分析 failure report，尝试不同方向。"
-                f"若参数微调已到瓶颈，考虑结构性或算法性改动。"
-                f"先读 journal.md，不要重试已失败的方向。"
-            )
-
-        if not feedback_parts:
-            break  # 边界合规 + 分数够 → 成功
+        if improvement >= MIN_IMPROVEMENT:
+            break  # 达标
 
         if attempt >= MAX_FEEDBACK:
             raise RuntimeError(
                 f"Optimizer failed after {MAX_FEEDBACK} feedback attempts. "
                 f"Last improvement: {improvement:+.3f} (target: +{MIN_IMPROVEMENT}). "
-                f"Violations in last attempt: {violations or 'none'}. "
                 f"Inspect round dir: {round_dir}"
             )
 
-        feedback_msg = "\n\n---\n\n".join(feedback_parts)
+        feedback_msg = (
+            f"当前 train avg_score = {after_train['avg_score']:.3f}，"
+            f"比本轮开始前提升了 {improvement:+.3f} 分，"
+            f"但目标是至少 +{MIN_IMPROVEMENT} 分（达到 {target_score}）。\n\n"
+            f"请继续分析 failure report，尝试不同方向。"
+            f"若参数微调已到瓶颈，考虑结构性或算法性改动。"
+            f"先读 journal.md，不要重试已失败的方向。"
+        )
 
-    # ── ⑨ 验证集评分 ──────────────────────────────────────────────────────────
+    # ── ⑧ 验证集评分 ──────────────────────────────────────────────────────────
     after_eval, _ = eval_module.evaluate("current", "eval")
     after_eval["run_type"] = "eval_after_optimizer"
     after_eval["round"] = round_index
@@ -919,7 +767,6 @@ def run_round(
     summary = {
         "round": round_index,
         "status": "completed",
-        "optimizer_changes": optimizer_changes,
         "before_train": before_train,
         "after_train": after_train,
         "after_eval": after_eval,
@@ -929,7 +776,7 @@ def run_round(
     duration_seconds = (datetime.now(timezone.utc) - round_start).total_seconds()
     summary["duration_seconds"] = round(duration_seconds, 1)
 
-    # ── ⑩ 存档 ────────────────────────────────
+    # ── ⑨ 存档 ────────────────────────────────
     failure_report_module.write_failure_report("current", "train", 5, failure_report)
     snapshot_round_artifacts(round_dir, data_home)
     update_training_curve(
@@ -937,9 +784,6 @@ def run_round(
         duration_seconds=duration_seconds,
     )
     write_json(round_dir / "summary.json", summary)
-
-    # 每轮单文件 copy_out：把运行槽里的 policy.py 持久化回 exp 目录
-    copy_out_policy(data_home)
     return summary
 
 
@@ -948,7 +792,7 @@ def main() -> None:
     parser.add_argument(
         "--exp",
         type=str,
-        help=f"Experiment name; data lives at {DATA_HOME_BASE}/<exp>/ (required unless --aggregate-only).",
+        help=f"Experiment name; data lives at {DATA_HOME_BASE}/<exp>/ (required unless --serve).",
     )
     parser.add_argument(
         "--serve",
@@ -1014,11 +858,14 @@ def main() -> None:
         print(f"Auto-forked experiment '{args.exp}' from '_baseline' at {data_home}")
 
     validate_data_home(data_home)
-    copy_in_policy(data_home)
-    _load_snake_hl_modules()  # snake_hl.policy 现在存在，可以 import 了
+
+    # 关键：设置 SNAKE_POLICY_PATH，让 trainer 自身的 import + 所有子进程都看到同一个
+    # exp policy.py。多个 train.py 并发跑各自的 SNAKE_POLICY_PATH 互不干扰。
+    os.environ["SNAKE_POLICY_PATH"] = str(data_home / "policy.py")
+
+    _load_snake_hl_modules()
     print(f"Loaded experiment '{args.exp}' from {data_home}")
 
-    # 每次运行创建带时间戳的 run dir（在 exp 目录下）
     if args.run_dir:
         run_dir = args.run_dir if args.run_dir.is_absolute() else data_home / args.run_dir
     else:
@@ -1044,12 +891,6 @@ def main() -> None:
             summaries.append(summary)
             print(json.dumps(summary, indent=2, sort_keys=True))
     finally:
-        # 即使中途崩溃，把当前运行槽的 policy.py 拷回去
-        if not args.dry_run:
-            try:
-                copy_out_policy(data_home)
-            except Exception as e:
-                print(f"WARNING: final copy_out failed: {e}", file=sys.stderr)
         stop_dashboard_server(dashboard_proc)
 
     write_json(run_dir / "run-summary.json", summaries)

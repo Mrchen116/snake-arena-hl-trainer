@@ -35,20 +35,22 @@ Use `train.py` as the default orchestration layer. Claude Code is the optimizer
 inside each round, not the owner of the whole training loop.
 
 1. `train.py` evaluates current train performance.
-2. `train.py` regenerates `experiments/reports/train-failures.md` and replay data.
-3. `train.py` writes an optimizer prompt under `experiments/runs/<timestamp>/round-XX/`.
-4. Claude Code edits only `snake_hl/policy.py` and `experiments/heuristic_notes.md`.
-5. `train.py` checks the optimizer edit boundary.
+2. `train.py` regenerates `experiments/<exp>/reports/train-failures.md` and replay data.
+3. `train.py` writes an optimizer prompt under `experiments/<exp>/runs/<timestamp>/round-XX/`.
+4. Claude Code edits files inside the experiment directory only — primarily
+   `policy.py` and `heuristic_notes.md`. Trainer paths are blocked at the
+   permission + sandbox layers.
+5. `train.py` reloads the policy via `policy_runtime.reload()`.
 6. `train.py` runs tests and train evaluation.
 7. `train.py` runs eval only after a meaningful train improvement.
-8. `train.py` writes round summaries and appends metrics to `experiments/trials.jsonl`.
+8. `train.py` writes round summaries and appends metrics to `experiments/<exp>/trials.jsonl`.
 
 Manual diagnosis should follow the same boundaries:
 
-- Read `experiments/heuristic_notes.md`.
-- Read `experiments/reports/train-failures.md`.
+- Read `experiments/<exp>/heuristic_notes.md`.
+- Read `experiments/<exp>/reports/train-failures.md`.
 - Inspect linked train replays if needed.
-- Edit only `snake_hl/policy.py` and `experiments/heuristic_notes.md`.
+- Edit only files under `experiments/<exp>/` (primarily `policy.py` and `heuristic_notes.md`).
 - Run train evaluation.
 - Run eval evaluation only after a meaningful train improvement.
 - Summarize what changed and whether it helped.
