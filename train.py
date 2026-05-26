@@ -659,13 +659,16 @@ def update_training_curve(
     before_train: dict,
     after_train: dict,
     after_eval: dict,
+    duration_seconds: float | None = None,
 ) -> None:
-    """追加一轮结果到训练曲线 JSON 并重新生成 HTML。每个实验有自己的曲线。
+    """追加一轮结果到 experiments/<exp>/training_curve.json。
 
-    同时刷新 experiments/all-curves.html 跨实验聚合视图。
+    Schema 包含完整 DL 面板需要的指标：score / food / survival / steps / deaths / 耗时，
+    便于 dashboard/index.html 多面板可视化（不止 avg_score 一项）。
+
+    HTML 不在这里生成——dashboard 是静态 viewer，运行时 fetch JSON。
     """
     curve_json = data_home / "training_curve.json"
-    curve_html = data_home / "training_curve.html"
 
     records: list[dict] = []
     if curve_json.exists():
@@ -674,306 +677,59 @@ def update_training_curve(
     global_round = len(records) + 1
     records.append({
         "round": global_round,
+        # Composite score
         "train_before": round(before_train["avg_score"], 3),
         "train_after": round(after_train["avg_score"], 3),
         "eval_after": round(after_eval["avg_score"], 3),
         "train_delta": round(after_train["avg_score"] - before_train["avg_score"], 3),
+        # Component metrics
+        "train_food": round(after_train.get("avg_food", 0), 3),
+        "eval_food": round(after_eval.get("avg_food", 0), 3),
+        "train_survival": round(after_train.get("survival_rate", 0), 4),
+        "eval_survival": round(after_eval.get("survival_rate", 0), 4),
+        "train_steps": round(after_train.get("avg_steps", 0), 2),
+        "eval_steps": round(after_eval.get("avg_steps", 0), 2),
+        "train_deaths": after_train.get("death_reasons", {}),
+        "eval_deaths": after_eval.get("death_reasons", {}),
+        # Wall-clock
+        "duration_seconds": round(duration_seconds, 1) if duration_seconds is not None else None,
         "timestamp": datetime.now(timezone.utc).isoformat(),
     })
     curve_json.write_text(json.dumps(records, indent=2) + "\n", encoding="utf-8")
-    generate_training_curve_html(records, curve_html, data_home.name)
-    update_aggregate_curve()
+    # 不再每轮生成 HTML 也不维护 index 文件——dashboard/index.html 是静态 viewer，
+    # 直接 parse http.server 返回的 experiments/ 目录 listing 来发现实验。
 
 
-def generate_training_curve_html(records: list[dict], curve_html: Path, exp_name: str) -> None:
-    """用 Chart.js 生成训练曲线 HTML。"""
-    labels = [f"R{r['round']}" for r in records]
-    train_data = [r["train_after"] for r in records]
-    eval_data = [r.get("eval_after") for r in records]
-
-    labels_js = json.dumps(labels)
-    train_js = json.dumps(train_data)
-    eval_js = json.dumps(eval_data)
-
-    valid_scores = [s for s in train_data + eval_data if s is not None]
-    y_min = round(min(valid_scores) * 0.97) if valid_scores else 0
-    y_max = round(max(valid_scores) * 1.02) if valid_scores else 800
-
-    def row(r: dict) -> str:
-        delta = r.get("train_delta")
-        before = r.get("train_before")
-        ts = r.get("timestamp", "")
-        before_cell = str(before) if before is not None else "—"
-        delta_cell = f'<td class="{"pos" if delta >= 0 else "neg"}">{delta:+.3f}</td>' if delta is not None else "<td>—</td>"
-        eval_cell = str(r["eval_after"]) if r.get("eval_after") is not None else "—"
-        return (
-            f'<tr><td>{r["round"]}</td>'
-            f'<td class="time" data-ts="{ts}"></td>'
-            f'<td>{before_cell}</td>'
-            f'<td>{r["train_after"]}</td>'
-            f'{delta_cell}'
-            f'<td>{eval_cell}</td></tr>'
-        )
-
-    timestamps = [r.get("timestamp", "") for r in records]
-    timestamps_js = json.dumps(timestamps)
-
-    html = f"""<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="UTF-8">
-<title>Snake HL Training Curve — {exp_name}</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
-<style>
-  body {{ font-family: sans-serif; background: #1a1a2e; color: #eee; padding: 24px; }}
-  h1 {{ font-size: 1.2rem; margin-bottom: 8px; }}
-  .meta {{ font-size: 0.85rem; color: #aaa; margin-bottom: 20px; }}
-  canvas {{ max-width: 900px; }}
-  table {{ border-collapse: collapse; margin-top: 24px; font-size: 0.85rem; }}
-  th, td {{ border: 1px solid #444; padding: 6px 12px; text-align: right; }}
-  th {{ background: #2a2a4e; }}
-  tr:hover td {{ background: #2a2a3e; }}
-  .pos {{ color: #6ef59a; }} .neg {{ color: #f56e6e; }}
-  td.time {{ color: #aaa; font-size: 0.8rem; }}
-</style>
-</head>
-<body>
-<h1>Snake Arena HL — Training Curve ({exp_name})</h1>
-<p class="meta">Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} &nbsp;|&nbsp; {len(records)} rounds</p>
-<canvas id="chart"></canvas>
-<script>
-const labels = {labels_js};
-const trainData = {train_js};
-const evalData = {eval_js};
-const timestamps = {timestamps_js};
-
-function fmtTime(ts) {{
-  if (!ts) return '';
-  return new Date(ts).toLocaleString('zh-CN', {{
-    month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hour12: false
-  }});
-}}
-
-new Chart(document.getElementById('chart'), {{
-  type: 'line',
-  data: {{
-    labels,
-    datasets: [
-      {{
-        label: 'Train avg_score',
-        data: trainData,
-        borderColor: '#4fc3f7',
-        backgroundColor: 'rgba(79,195,247,0.1)',
-        pointRadius: 5,
-        tension: 0.3,
-      }},
-      {{
-        label: 'Eval avg_score',
-        data: evalData,
-        borderColor: '#a5d6a7',
-        backgroundColor: 'rgba(165,214,167,0.1)',
-        pointRadius: 5,
-        tension: 0.3,
-        spanGaps: false,
-      }},
-    ],
-  }},
-  options: {{
-    scales: {{
-      y: {{ min: {y_min}, max: {y_max}, grid: {{ color: '#333' }}, ticks: {{ color: '#ccc' }} }},
-      x: {{ grid: {{ color: '#333' }}, ticks: {{ color: '#ccc', maxRotation: 0 }} }},
-    }},
-    plugins: {{
-      legend: {{ labels: {{ color: '#eee' }} }},
-      tooltip: {{
-        mode: 'index',
-        intersect: false,
-        callbacks: {{
-          afterTitle: (items) => {{
-            const ts = timestamps[items[0].dataIndex];
-            return ts ? fmtTime(ts) : '';
-          }},
-        }},
-      }},
-    }},
-  }},
-}});
-
-document.querySelectorAll('td.time').forEach(el => {{
-  el.textContent = fmtTime(el.dataset.ts);
-}});
-</script>
-<table>
-<tr><th>Round</th><th>Time</th><th>Train before</th><th>Train after</th><th>Delta</th><th>Eval after</th></tr>
-{"".join(row(r) for r in records)}
-</table>
-</body>
-</html>
-"""
-    curve_html.write_text(html, encoding="utf-8")
-
-
-def update_aggregate_curve() -> None:
+def start_dashboard_server(port: int = 8765) -> subprocess.Popen | None:
     """
-    扫描 experiments/*/training_curve.json，把所有实验的曲线画在一个 HTML 里，
-    便于跨实验对比（类比 wandb 的 project view）。
+    起一个 python -m http.server 子进程，bind 127.0.0.1，serve trainer root。
+    dashboard/index.html 通过 fetch 拉 experiments/*/training_curve.json 渲染面板。
 
-    输出到 experiments/all-curves.html。每个实验一种颜色，train 实线 + eval 虚线。
-    X 轴是 round 号；不同实验长度不同时，短的会留空白（spanGaps=false）。
-    没有任何实验数据时跳过（不会写空文件）。
+    返回 Popen 句柄；main() 在 finally 里 terminate 它。
+    端口被占用等异常时打印警告并返回 None（不阻断训练）。
     """
-    if not DATA_HOME_BASE.exists():
-        return
-
-    experiments_data: list[dict] = []
-    for exp_dir in sorted(DATA_HOME_BASE.iterdir()):
-        if not exp_dir.is_dir() or exp_dir.name.startswith("."):
-            continue
-        curve_json = exp_dir / "training_curve.json"
-        if not curve_json.exists():
-            continue
-        try:
-            records = json.loads(curve_json.read_text(encoding="utf-8"))
-        except json.JSONDecodeError:
-            continue
-        if records:
-            experiments_data.append({"name": exp_dir.name, "records": records})
-
-    if not experiments_data:
-        return
-
-    max_round = max(max(r["round"] for r in exp["records"]) for exp in experiments_data)
-    labels = [f"R{i + 1}" for i in range(max_round)]
-
-    # 暗色背景上效果较好的 8 色调色板（与 Tailwind 接近的中等亮度色）
-    palette = [
-        "#4fc3f7", "#a5d6a7", "#ffb74d", "#f06292",
-        "#ba68c8", "#7986cb", "#e57373", "#90a4ae",
-    ]
-
-    datasets: list[dict] = []
-    all_scores: list[float] = []
-    summary_rows: list[str] = []
-    for i, exp in enumerate(experiments_data):
-        color = palette[i % len(palette)]
-        records = exp["records"]
-        train_data: list[float | None] = [None] * max_round
-        eval_data: list[float | None] = [None] * max_round
-        for r in records:
-            idx = r["round"] - 1
-            if 0 <= idx < max_round:
-                train_data[idx] = r.get("train_after")
-                eval_data[idx] = r.get("eval_after")
-                for v in (r.get("train_after"), r.get("eval_after")):
-                    if v is not None:
-                        all_scores.append(v)
-        datasets.append({
-            "label": f"{exp['name']} train",
-            "data": train_data,
-            "borderColor": color,
-            "backgroundColor": "transparent",
-            "pointRadius": 3,
-            "tension": 0.3,
-            "spanGaps": False,
-        })
-        datasets.append({
-            "label": f"{exp['name']} eval",
-            "data": eval_data,
-            "borderColor": color,
-            "backgroundColor": "transparent",
-            "borderDash": [5, 5],
-            "pointRadius": 3,
-            "tension": 0.3,
-            "spanGaps": False,
-        })
-
-        # 汇总表行：最后一轮的状态
-        last = records[-1]
-        summary_rows.append(
-            f'<tr>'
-            f'<td><span class="swatch" style="background:{color}"></span>{exp["name"]}</td>'
-            f'<td>{len(records)}</td>'
-            f'<td>{last.get("train_after", "—")}</td>'
-            f'<td>{last.get("eval_after", "—")}</td>'
-            f'<td class="time" data-ts="{last.get("timestamp", "")}"></td>'
-            f'</tr>'
+    try:
+        proc = subprocess.Popen(
+            [sys.executable, "-m", "http.server", "--bind", "127.0.0.1", str(port)],
+            cwd=ROOT,
+            stdout=subprocess.DEVNULL,
+            stderr=subprocess.DEVNULL,
         )
+    except Exception as e:
+        print(f"WARNING: dashboard server failed to start: {e}", file=sys.stderr)
+        return None
+    print(f"📊 Dashboard: http://localhost:{port}/dashboard/")
+    return proc
 
-    y_min = round(min(all_scores) * 0.97) if all_scores else 0
-    y_max = round(max(all_scores) * 1.02) if all_scores else 800
 
-    labels_js = json.dumps(labels)
-    datasets_js = json.dumps(datasets)
-
-    html = f"""<!DOCTYPE html>
-<html lang="zh">
-<head>
-<meta charset="UTF-8">
-<title>Snake HL — All Experiments</title>
-<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
-<style>
-  body {{ font-family: sans-serif; background: #1a1a2e; color: #eee; padding: 24px; }}
-  h1 {{ font-size: 1.2rem; margin-bottom: 8px; }}
-  .meta {{ font-size: 0.85rem; color: #aaa; margin-bottom: 20px; }}
-  canvas {{ max-width: 1100px; }}
-  table {{ border-collapse: collapse; margin-top: 24px; font-size: 0.85rem; }}
-  th, td {{ border: 1px solid #444; padding: 6px 12px; text-align: right; }}
-  th {{ background: #2a2a4e; }}
-  td:first-child {{ text-align: left; }}
-  tr:hover td {{ background: #2a2a3e; }}
-  td.time {{ color: #aaa; font-size: 0.8rem; }}
-  .swatch {{
-    display: inline-block; width: 10px; height: 10px;
-    margin-right: 6px; border-radius: 2px; vertical-align: middle;
-  }}
-  .legend-note {{ color: #888; font-size: 0.8rem; margin-top: 8px; }}
-</style>
-</head>
-<body>
-<h1>Snake Arena HL — All Experiments</h1>
-<p class="meta">Generated: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M UTC')} &nbsp;|&nbsp; {len(experiments_data)} experiments</p>
-<canvas id="chart"></canvas>
-<p class="legend-note">实线 = train avg_score，虚线 = eval avg_score。同色 = 同一实验。</p>
-<script>
-const labels = {labels_js};
-const datasets = {datasets_js};
-
-function fmtTime(ts) {{
-  if (!ts) return '';
-  return new Date(ts).toLocaleString('zh-CN', {{
-    month: '2-digit', day: '2-digit',
-    hour: '2-digit', minute: '2-digit', hour12: false
-  }});
-}}
-
-new Chart(document.getElementById('chart'), {{
-  type: 'line',
-  data: {{ labels, datasets }},
-  options: {{
-    scales: {{
-      y: {{ min: {y_min}, max: {y_max}, grid: {{ color: '#333' }}, ticks: {{ color: '#ccc' }} }},
-      x: {{ grid: {{ color: '#333' }}, ticks: {{ color: '#ccc', maxRotation: 0 }} }},
-    }},
-    plugins: {{
-      legend: {{ labels: {{ color: '#eee', boxWidth: 14 }} }},
-      tooltip: {{ mode: 'index', intersect: false }},
-    }},
-  }},
-}});
-
-document.querySelectorAll('td.time').forEach(el => {{
-  el.textContent = fmtTime(el.dataset.ts);
-}});
-</script>
-<table>
-<tr><th>Experiment</th><th>Rounds</th><th>Latest train</th><th>Latest eval</th><th>Last updated</th></tr>
-{"".join(summary_rows)}
-</table>
-</body>
-</html>
-"""
-    (DATA_HOME_BASE / "all-curves.html").write_text(html, encoding="utf-8")
+def stop_dashboard_server(proc: subprocess.Popen | None) -> None:
+    if proc is None:
+        return
+    proc.terminate()
+    try:
+        proc.wait(timeout=2)
+    except subprocess.TimeoutExpired:
+        proc.kill()
 
 
 # ============================================================
@@ -1008,6 +764,7 @@ def run_round(
     round_dir = run_dir / f"round-{round_index:02d}"
     round_dir.mkdir(parents=True, exist_ok=True)
     failure_report = data_home / "reports" / "train-failures.md"
+    round_start = datetime.now(timezone.utc)
 
     # ── ① 前向推理 ───────────────────────────
     if cached_before_train is not None:
@@ -1085,10 +842,16 @@ def run_round(
         "train_avg_score_delta": round(improvement, 3),
     }
 
+    duration_seconds = (datetime.now(timezone.utc) - round_start).total_seconds()
+    summary["duration_seconds"] = round(duration_seconds, 1)
+
     # ── ⑩ 存档 ────────────────────────────────
     failure_report_module.write_failure_report("current", "train", 5, failure_report)
     snapshot_round_artifacts(round_dir, data_home)
-    update_training_curve(data_home, round_index, before_train, after_train, after_eval)
+    update_training_curve(
+        data_home, round_index, before_train, after_train, after_eval,
+        duration_seconds=duration_seconds,
+    )
     write_json(round_dir / "summary.json", summary)
 
     # 每轮单文件 copy_out：把运行槽里的 policy.py 持久化回 exp 目录
@@ -1104,9 +867,15 @@ def main() -> None:
         help=f"Experiment name; data lives at {DATA_HOME_BASE}/<exp>/ (required unless --aggregate-only).",
     )
     parser.add_argument(
-        "--aggregate-only",
+        "--serve",
         action="store_true",
-        help="Regenerate experiments/all-curves.html from existing training_curve.json files and exit.",
+        help="Start the dashboard HTTP server and keep running (no training). Ctrl-C to stop.",
+    )
+    parser.add_argument(
+        "--dashboard-port",
+        type=int,
+        default=8765,
+        help="Port for the dashboard HTTP server (default: 8765).",
     )
     parser.add_argument(
         "--new-from",
@@ -1125,14 +894,18 @@ def main() -> None:
     parser.add_argument("--run-dir", type=Path)
     args = parser.parse_args()
 
-    if args.aggregate_only:
-        update_aggregate_curve()
-        target = DATA_HOME_BASE / "all-curves.html"
-        print(f"Aggregate curve regenerated: {target}")
+    if args.serve:
+        proc = start_dashboard_server(args.dashboard_port)
+        if proc is None:
+            sys.exit(1)
+        try:
+            proc.wait()
+        except KeyboardInterrupt:
+            stop_dashboard_server(proc)
         return
 
     if not args.exp:
-        parser.error("--exp is required (unless --aggregate-only)")
+        parser.error("--exp is required (unless --serve)")
 
     data_home = data_home_for(args.exp)
 
@@ -1159,6 +932,8 @@ def main() -> None:
         run_dir = data_home / "runs" / utc_stamp()
     run_dir.mkdir(parents=True, exist_ok=True)
 
+    dashboard_proc = None if args.dry_run else start_dashboard_server(args.dashboard_port)
+
     summaries: list[dict] = []
     cached_before_train: dict | None = None
     try:
@@ -1182,6 +957,7 @@ def main() -> None:
                 copy_out_policy(data_home)
             except Exception as e:
                 print(f"WARNING: final copy_out failed: {e}", file=sys.stderr)
+        stop_dashboard_server(dashboard_proc)
 
     write_json(run_dir / "run-summary.json", summaries)
     print(f"run_dir={run_dir}")

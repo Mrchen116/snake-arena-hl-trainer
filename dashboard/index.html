@@ -1,0 +1,457 @@
+<!DOCTYPE html>
+<html lang="zh">
+<head>
+<meta charset="UTF-8">
+<title>Snake HL — Dashboard</title>
+<script src="https://cdn.jsdelivr.net/npm/chart.js@4/dist/chart.umd.min.js"></script>
+<style>
+  body { font-family: -apple-system, BlinkMacSystemFont, sans-serif; background: #1a1a2e; color: #eee; padding: 24px; margin: 0; }
+  header { max-width: 1400px; margin: 0 auto 20px; }
+  h1 { font-size: 1.3rem; margin: 0 0 8px; }
+  .controls { display: flex; gap: 16px; align-items: center; flex-wrap: wrap; font-size: 0.9rem; }
+  .controls select, .controls button { font-size: 0.9rem; padding: 4px 10px; background: #2a2a4e; color: #eee; border: 1px solid #444; border-radius: 4px; cursor: pointer; }
+  .controls button:hover { background: #3a3a5e; }
+  .meta { font-size: 0.8rem; color: #888; }
+  main { max-width: 1400px; margin: 0 auto; }
+  .grid {
+    display: grid;
+    grid-template-columns: repeat(2, 1fr);
+    gap: 16px;
+  }
+  .panel {
+    background: #232336;
+    padding: 14px 16px 18px;
+    border-radius: 6px;
+  }
+  .panel.wide { grid-column: 1 / -1; }
+  .panel h2 {
+    font-size: 0.9rem;
+    margin: 0 0 10px;
+    color: #ccc;
+    font-weight: 500;
+  }
+  .panel-canvas-wrap {
+    position: relative;
+    height: 240px;
+  }
+  .panel.wide .panel-canvas-wrap { height: 260px; }
+  table { border-collapse: collapse; margin-top: 24px; font-size: 0.85rem; width: 100%; max-width: 1400px; }
+  th, td { border: 1px solid #444; padding: 6px 12px; text-align: right; }
+  th { background: #2a2a4e; font-weight: 500; }
+  td:first-child { text-align: left; }
+  tr:hover td { background: #2a2a3e; }
+  .pos { color: #6ef59a; } .neg { color: #f56e6e; }
+  td.time { color: #aaa; font-size: 0.8rem; }
+  .swatch {
+    display: inline-block; width: 10px; height: 10px;
+    margin-right: 6px; border-radius: 2px; vertical-align: middle;
+  }
+  #status { color: #888; font-size: 0.8rem; }
+  #status.err { color: #f56e6e; }
+  .empty-hint { color: #666; font-size: 0.8rem; padding: 12px 0; text-align: center; }
+</style>
+</head>
+<body>
+<header>
+  <h1>Snake Arena HL — Dashboard</h1>
+  <div class="controls">
+    <label>Experiment:
+      <select id="expSelector"></select>
+    </label>
+    <button id="refreshBtn">Refresh now</button>
+    <label><input type="checkbox" id="autoRefresh" checked> Auto-refresh 30s</label>
+    <span id="status"></span>
+  </div>
+</header>
+<main>
+  <div class="grid">
+    <div class="panel"><h2>avg_score</h2><div class="panel-canvas-wrap"><canvas id="panel-score"></canvas></div></div>
+    <div class="panel"><h2>train − eval gap (overfitting watch)</h2><div class="panel-canvas-wrap"><canvas id="panel-gap"></canvas></div></div>
+    <div class="panel"><h2>avg_food per episode</h2><div class="panel-canvas-wrap"><canvas id="panel-food"></canvas></div></div>
+    <div class="panel"><h2>survival_rate</h2><div class="panel-canvas-wrap"><canvas id="panel-survival"></canvas></div></div>
+    <div class="panel wide" id="deathsPanel"><h2>death reasons stacked (train, # episodes out of 200)</h2><div class="panel-canvas-wrap"><canvas id="panel-deaths"></canvas></div></div>
+    <div class="panel wide"><h2>wall-clock per round (minutes)</h2><div class="panel-canvas-wrap"><canvas id="panel-duration"></canvas></div></div>
+  </div>
+  <table id="summaryTable"></table>
+</main>
+<script>
+// ── 调色板 ──────────────────────────────────────
+// 实验上的颜色（aggregate 模式：每个 exp 一色）
+const EXP_PALETTE = ["#4fc3f7", "#a5d6a7", "#ffb74d", "#f06292", "#ba68c8", "#7986cb", "#e57373", "#90a4ae"];
+// 单 exp 模式下，train/eval 同色；多 metric 时不同色
+const COLORS = {
+  score: "#4fc3f7",
+  gap: "#ce93d8",
+  food: "#a5d6a7",
+  survival: "#ffb74d",
+  duration: "#7986cb",
+  // death reasons
+  deaths: {
+    self: "#ef5350",
+    wall: "#ff7043",
+    starvation: "#ffca28",
+    survived: "#66bb6a",
+  },
+  default: "#9e9e9e",
+};
+
+// ── Chart.js 公共 options ──────────────────────
+const COMMON_OPTS = {
+  maintainAspectRatio: false,
+  responsive: true,
+  scales: {
+    y: { grid: { color: "#333" }, ticks: { color: "#bbb" } },
+    x: { grid: { color: "#333" }, ticks: { color: "#bbb", maxRotation: 0 } },
+  },
+  plugins: {
+    legend: { labels: { color: "#eee", boxWidth: 12, font: { size: 11 } } },
+    tooltip: { mode: "index", intersect: false },
+  },
+  elements: { point: { radius: 3 }, line: { tension: 0.25 } },
+};
+
+const charts = {};
+function destroyAllCharts() {
+  for (const k of Object.keys(charts)) {
+    charts[k]?.destroy();
+    delete charts[k];
+  }
+}
+
+function setStatus(text, isErr=false) {
+  const el = document.getElementById("status");
+  el.textContent = text;
+  el.className = isErr ? "err" : "";
+}
+
+function fmtTime(ts) {
+  if (!ts) return "";
+  return new Date(ts).toLocaleString("zh-CN", {
+    month: "2-digit", day: "2-digit", hour: "2-digit", minute: "2-digit", hour12: false
+  });
+}
+
+// ── 数据加载 ────────────────────────────────────
+// 直接 parse python -m http.server 的目录 listing；
+// 实验列表 = experiments/ 下所有子目录（去掉 dot-prefix 和 parent link）。
+async function loadIndex() {
+  const res = await fetch("/experiments/?_=" + Date.now());
+  if (!res.ok) throw new Error("Cannot list /experiments/ (HTTP " + res.status + ")");
+  const html = await res.text();
+  const doc = new DOMParser().parseFromString(html, "text/html");
+  const exps = [];
+  for (const a of doc.querySelectorAll("a")) {
+    const href = a.getAttribute("href") || "";
+    // 目录以 '/' 结尾；跳过 '../' 和 dot-prefix
+    if (!href.endsWith("/")) continue;
+    if (href === "../" || href.startsWith(".") || href.startsWith("/")) continue;
+    exps.push(decodeURIComponent(href.slice(0, -1)));
+  }
+  exps.sort();
+  return { experiments: exps };
+}
+
+async function loadExp(name) {
+  const res = await fetch("/experiments/" + encodeURIComponent(name) + "/training_curve.json?_=" + Date.now());
+  if (!res.ok) throw new Error("Cannot load " + name + "/training_curve.json (HTTP " + res.status + ")");
+  return await res.json();
+}
+
+// ── 图表渲染 ────────────────────────────────────
+// records: [{round, train_after, eval_after, train_food, ..., train_deaths, ...}, ...]
+function buildSeries(records, key) {
+  return records.map(r => r[key] ?? null);
+}
+function buildGap(records) {
+  return records.map(r => {
+    const ta = r.train_after, ea = r.eval_after;
+    return (ta != null && ea != null) ? +(ta - ea).toFixed(3) : null;
+  });
+}
+function buildDurationMinutes(records) {
+  return records.map(r => r.duration_seconds != null ? +(r.duration_seconds / 60).toFixed(2) : null);
+}
+
+function renderSingleExp(records, expName) {
+  destroyAllCharts();
+  document.getElementById("deathsPanel").style.display = "";
+  const labels = records.map(r => "R" + r.round);
+  const c = COLORS.score;
+
+  // Panel 1: avg_score
+  charts.score = new Chart(document.getElementById("panel-score"), {
+    type: "line",
+    data: { labels, datasets: [
+      { label: "train", data: buildSeries(records, "train_after"), borderColor: COLORS.score, backgroundColor: "transparent", spanGaps: false },
+      { label: "eval",  data: buildSeries(records, "eval_after"),  borderColor: COLORS.score, backgroundColor: "transparent", borderDash: [5,5], spanGaps: false },
+    ] },
+    options: COMMON_OPTS,
+  });
+
+  // Panel 2: gap
+  charts.gap = new Chart(document.getElementById("panel-gap"), {
+    type: "line",
+    data: { labels, datasets: [
+      { label: "train − eval", data: buildGap(records), borderColor: COLORS.gap, backgroundColor: "transparent", spanGaps: false },
+    ] },
+    options: COMMON_OPTS,
+  });
+
+  // Panel 3: food
+  charts.food = new Chart(document.getElementById("panel-food"), {
+    type: "line",
+    data: { labels, datasets: [
+      { label: "train", data: buildSeries(records, "train_food"), borderColor: COLORS.food, backgroundColor: "transparent", spanGaps: false },
+      { label: "eval",  data: buildSeries(records, "eval_food"),  borderColor: COLORS.food, backgroundColor: "transparent", borderDash: [5,5], spanGaps: false },
+    ] },
+    options: COMMON_OPTS,
+  });
+
+  // Panel 4: survival
+  charts.survival = new Chart(document.getElementById("panel-survival"), {
+    type: "line",
+    data: { labels, datasets: [
+      { label: "train", data: buildSeries(records, "train_survival"), borderColor: COLORS.survival, backgroundColor: "transparent", spanGaps: false },
+      { label: "eval",  data: buildSeries(records, "eval_survival"),  borderColor: COLORS.survival, backgroundColor: "transparent", borderDash: [5,5], spanGaps: false },
+    ] },
+    options: { ...COMMON_OPTS, scales: { ...COMMON_OPTS.scales, y: { ...COMMON_OPTS.scales.y, min: 0, max: 1, ticks: { ...COMMON_OPTS.scales.y.ticks, callback: v => (v*100).toFixed(0)+"%" } } } },
+  });
+
+  // Panel 5: deaths stacked (train)
+  // 从所有 records 的 train_deaths 收集所有出现过的 key，按固定优先级排序
+  const allDeathKeys = new Set();
+  for (const r of records) {
+    for (const k of Object.keys(r.train_deaths || {})) allDeathKeys.add(k);
+  }
+  const orderedKeys = ["self", "wall", "starvation", "survived"].filter(k => allDeathKeys.has(k))
+    .concat([...allDeathKeys].filter(k => !["self","wall","starvation","survived"].includes(k)).sort());
+  const deathDatasets = orderedKeys.map(k => ({
+    label: k,
+    data: records.map(r => (r.train_deaths || {})[k] ?? 0),
+    backgroundColor: COLORS.deaths[k] || COLORS.default,
+    borderColor: COLORS.deaths[k] || COLORS.default,
+    fill: true,
+    stack: "deaths",
+    pointRadius: 0,
+    tension: 0,
+  }));
+  charts.deaths = new Chart(document.getElementById("panel-deaths"), {
+    type: "line",
+    data: { labels, datasets: deathDatasets },
+    options: { ...COMMON_OPTS, scales: { ...COMMON_OPTS.scales, y: { ...COMMON_OPTS.scales.y, stacked: true } } },
+  });
+
+  // Panel 6: wall-clock
+  charts.duration = new Chart(document.getElementById("panel-duration"), {
+    type: "bar",
+    data: { labels, datasets: [
+      { label: "minutes", data: buildDurationMinutes(records), backgroundColor: COLORS.duration, borderColor: COLORS.duration },
+    ] },
+    options: COMMON_OPTS,
+  });
+
+  renderTable(records, expName);
+}
+
+function renderAllExp(allData) {
+  // allData: [{name, records}]
+  destroyAllCharts();
+  // 多实验视图下隐藏 death panel（多色堆叠会糊在一起）
+  document.getElementById("deathsPanel").style.display = "none";
+
+  const maxRound = Math.max(...allData.map(d => Math.max(...d.records.map(r => r.round))), 0);
+  const labels = Array.from({length: maxRound}, (_, i) => "R" + (i+1));
+
+  // 为每个 exp 分别构造数据数组（不存在的 round 用 null）
+  function pad(records, key) {
+    const out = new Array(maxRound).fill(null);
+    for (const r of records) {
+      const idx = r.round - 1;
+      if (idx >= 0 && idx < maxRound) out[idx] = r[key] ?? null;
+    }
+    return out;
+  }
+  function padGap(records) {
+    const out = new Array(maxRound).fill(null);
+    for (const r of records) {
+      const idx = r.round - 1;
+      const ta = r.train_after, ea = r.eval_after;
+      if (idx >= 0 && idx < maxRound && ta != null && ea != null) {
+        out[idx] = +(ta - ea).toFixed(3);
+      }
+    }
+    return out;
+  }
+  function padDuration(records) {
+    const out = new Array(maxRound).fill(null);
+    for (const r of records) {
+      const idx = r.round - 1;
+      if (idx >= 0 && idx < maxRound && r.duration_seconds != null) {
+        out[idx] = +(r.duration_seconds / 60).toFixed(2);
+      }
+    }
+    return out;
+  }
+
+  function multiExpDatasets(buildFn, opts={}) {
+    const sets = [];
+    allData.forEach((d, i) => {
+      const color = EXP_PALETTE[i % EXP_PALETTE.length];
+      const trainData = buildFn(d.records, opts.trainKey);
+      const evalData  = opts.evalKey ? buildFn(d.records, opts.evalKey) : null;
+      if (!opts.evalKey) {
+        // single-line metric (gap, duration)
+        sets.push({ label: d.name, data: trainData, borderColor: color, backgroundColor: opts.bar ? color : "transparent", spanGaps: false });
+      } else {
+        sets.push({ label: d.name + " train", data: trainData, borderColor: color, backgroundColor: "transparent", spanGaps: false });
+        sets.push({ label: d.name + " eval",  data: evalData,  borderColor: color, backgroundColor: "transparent", borderDash: [5,5], spanGaps: false });
+      }
+    });
+    return sets;
+  }
+
+  charts.score = new Chart(document.getElementById("panel-score"), {
+    type: "line",
+    data: { labels, datasets: multiExpDatasets((recs, k) => pad(recs, k), { trainKey: "train_after", evalKey: "eval_after" }) },
+    options: COMMON_OPTS,
+  });
+
+  charts.gap = new Chart(document.getElementById("panel-gap"), {
+    type: "line",
+    data: { labels, datasets: multiExpDatasets((recs) => padGap(recs)) },
+    options: COMMON_OPTS,
+  });
+
+  charts.food = new Chart(document.getElementById("panel-food"), {
+    type: "line",
+    data: { labels, datasets: multiExpDatasets((recs, k) => pad(recs, k), { trainKey: "train_food", evalKey: "eval_food" }) },
+    options: COMMON_OPTS,
+  });
+
+  charts.survival = new Chart(document.getElementById("panel-survival"), {
+    type: "line",
+    data: { labels, datasets: multiExpDatasets((recs, k) => pad(recs, k), { trainKey: "train_survival", evalKey: "eval_survival" }) },
+    options: { ...COMMON_OPTS, scales: { ...COMMON_OPTS.scales, y: { ...COMMON_OPTS.scales.y, min: 0, max: 1, ticks: { ...COMMON_OPTS.scales.y.ticks, callback: v => (v*100).toFixed(0)+"%" } } } },
+  });
+
+  charts.duration = new Chart(document.getElementById("panel-duration"), {
+    type: "bar",
+    data: { labels, datasets: multiExpDatasets((recs) => padDuration(recs), { bar: true }) },
+    options: COMMON_OPTS,
+  });
+
+  // Summary 表（多实验：每实验一行最新状态）
+  const rows = allData.map((d, i) => {
+    const last = d.records[d.records.length - 1] || {};
+    const color = EXP_PALETTE[i % EXP_PALETTE.length];
+    return `<tr>
+      <td><span class="swatch" style="background:${color}"></span>${d.name}</td>
+      <td>${d.records.length}</td>
+      <td>${last.train_after ?? "—"}</td>
+      <td>${last.eval_after ?? "—"}</td>
+      <td>${last.train_survival != null ? (last.train_survival * 100).toFixed(1) + "%" : "—"}</td>
+      <td>${last.duration_seconds != null ? (last.duration_seconds / 60).toFixed(1) + " min" : "—"}</td>
+      <td class="time">${fmtTime(last.timestamp || "")}</td>
+    </tr>`;
+  }).join("");
+  document.getElementById("summaryTable").innerHTML = `
+    <tr><th>Experiment</th><th>Rounds</th><th>Latest train</th><th>Latest eval</th><th>Train survival</th><th>Last round time</th><th>Last update</th></tr>
+    ${rows}`;
+}
+
+function renderTable(records, expName) {
+  // Per-exp summary table: per-round detail
+  const rows = records.map(r => {
+    const delta = r.train_delta;
+    const deltaCell = delta != null
+      ? `<td class="${delta >= 0 ? "pos" : "neg"}">${delta >= 0 ? "+" : ""}${delta.toFixed(3)}</td>`
+      : "<td>—</td>";
+    const durCell = r.duration_seconds != null ? (r.duration_seconds / 60).toFixed(1) + " min" : "—";
+    return `<tr>
+      <td>${r.round}</td>
+      <td class="time">${fmtTime(r.timestamp || "")}</td>
+      <td>${r.train_before ?? "—"}</td>
+      <td>${r.train_after ?? "—"}</td>
+      ${deltaCell}
+      <td>${r.eval_after ?? "—"}</td>
+      <td>${r.train_survival != null ? (r.train_survival * 100).toFixed(1) + "%" : "—"}</td>
+      <td>${durCell}</td>
+    </tr>`;
+  }).join("");
+  document.getElementById("summaryTable").innerHTML = `
+    <tr><th>Round</th><th>Time</th><th>Train before</th><th>Train after</th><th>Δ</th><th>Eval after</th><th>Train survival</th><th>Wall-clock</th></tr>
+    ${rows}`;
+}
+
+// ── 主流程 ────────────────────────────────────
+let currentExpList = [];
+
+async function refreshExpSelector() {
+  try {
+    const idx = await loadIndex();
+    const exps = idx.experiments || [];
+    currentExpList = exps;
+    const sel = document.getElementById("expSelector");
+    const prev = sel.value;
+    sel.innerHTML = "";
+    const allOpt = document.createElement("option");
+    allOpt.value = "__all__";
+    allOpt.textContent = "All experiments (compare)";
+    sel.appendChild(allOpt);
+    for (const name of exps) {
+      const opt = document.createElement("option");
+      opt.value = name;
+      opt.textContent = name;
+      sel.appendChild(opt);
+    }
+    if (exps.includes(prev) || prev === "__all__") sel.value = prev;
+  } catch (e) {
+    setStatus("Failed to load experiment list: " + e.message, true);
+  }
+}
+
+async function refresh() {
+  const sel = document.getElementById("expSelector");
+  const choice = sel.value;
+  try {
+    if (choice === "__all__" || !choice) {
+      const allData = [];
+      for (const name of currentExpList) {
+        try {
+          const records = await loadExp(name);
+          if (records.length) allData.push({ name, records });
+        } catch (e) { /* skip exp with no data */ }
+      }
+      renderAllExp(allData);
+    } else {
+      const records = await loadExp(choice);
+      renderSingleExp(records, choice);
+    }
+    setStatus("Updated " + fmtTime(new Date().toISOString()));
+  } catch (e) {
+    setStatus("Refresh failed: " + e.message, true);
+  }
+}
+
+async function init() {
+  await refreshExpSelector();
+  await refresh();
+}
+
+document.getElementById("expSelector").addEventListener("change", refresh);
+document.getElementById("refreshBtn").addEventListener("click", async () => {
+  await refreshExpSelector();
+  await refresh();
+});
+
+setInterval(async () => {
+  if (document.getElementById("autoRefresh").checked) {
+    await refreshExpSelector();
+    await refresh();
+  }
+}, 30000);
+
+init();
+</script>
+</body>
+</html>
