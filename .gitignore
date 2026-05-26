@@ -13,6 +13,9 @@ __pycache__/
 # locations are local-only scratch from the trainer's perspective.
 snake_hl/policy.py
 experiments/
+!experiments/_baseline/
+!experiments/_baseline/policy.py
+!experiments/_baseline/heuristic_notes.md
 
 # Editor / IDE state
 .claude/

@@ -1013,6 +1013,15 @@ def main() -> None:
         validate_data_home(base)
         shutil.copytree(base, data_home, ignore=shutil.ignore_patterns(".git", ".claude"))
         print(f"Forked experiment '{args.exp}' from '{args.new_from}' at {data_home}")
+    elif not data_home.exists():
+        baseline = data_home_for("_baseline")
+        if not baseline.is_dir() or not (baseline / "policy.py").is_file():
+            raise RuntimeError(
+                f"Experiment '{args.exp}' not found at {data_home} and no _baseline exists.\n"
+                f"Create experiments/_baseline/policy.py first, or use --new-from <existing-exp>."
+            )
+        shutil.copytree(baseline, data_home, ignore=shutil.ignore_patterns(".git", ".claude"))
+        print(f"Auto-forked experiment '{args.exp}' from '_baseline' at {data_home}")
 
     validate_data_home(data_home)
     copy_in_policy(data_home)
